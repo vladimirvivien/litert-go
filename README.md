@@ -1,31 +1,29 @@
 # litert-go
 
-A no-CGO Go binding for the **LiteRT CompiledModel C API**, and a runtime that
-drives LLM inference (prefill/decode, KV cache, sampling, speculative decoding)
-from Go. Exploratory — see the planning docs in
-`~/DEV/project-planning/litert-go/`.
+A no-CGO Go binding for the **LiteRT CompiledModel C API**, with a Go-driven LLM
+decode runtime (prefill, fixed-context KV cache, greedy decode) built on top.
 
-**Status:** Working text-in/text-out LLM inference — pure Go, no CGO. Against an
-upstream-built `libLiteRt`, `cmd/decode` runs the full pipeline on CPU: text →
-SentencePiece (pure-Go `eliben/go-sentencepiece`, loaded from the `.litertlm`'s
-embedded tokenizer) → prefill → greedy decode → detokenize → text. Verified
-correct on Gemma 3 1B:
+`cmd/decode` runs the full pipeline on CPU: text → SentencePiece tokenizer
+(pure-Go `eliben/go-sentencepiece`, loaded from the `.litertlm`'s embedded
+tokenizer section) → prefill → greedy decode → detokenize → text.
 
 ```
-$ decode -lib <libLiteRt dir> -model gemma3-1b-it-int4.litertlm -text "The capital of France is"
-output: " Paris.\n..."
+decode -lib <libLiteRt dir> -model gemma3-1b-it-int4.litertlm -text "The capital of France is"
+output: " Paris."
 ```
 
-The models are statically shaped (fixed-context KV cache; `decode` →
-`logits f32[1,1,vocab]`); no resize or KV-cache growth is needed.
+Models are statically shaped: the KV cache is the full fixed context, `decode`
+produces `logits f32[1,1,vocab]`, and no resize or KV-cache growth occurs.
 
-Two constraints are documented in the code: the MSVC `LiteRtRankedTensorType`
-struct layout (dimensions at offset 12), and the rule for handing Go pointers to
-the C side across the ffi boundary — every Go variable whose address reaches C
-must be pinned with `runtime.Pinner` for the duration of the call, because the
-goroutine stack can move mid-call and the stack mover does not rewrite addresses
-laundered through `unsafe.Pointer`. Each wrapper in `litert/litert.go` owns a
-Pinner and pins its argument slots; see the convention note in `litert/ffi.go`.
+**Constraints in the binding:**
+
+- The MSVC build of `libLiteRt` lays out `LiteRtRankedTensorType` with dimensions
+  at offset 12 (the `rank`/`has_strides` bitfields are not packed); the Windows
+  binding reads shapes accordingly.
+- Every Go variable whose address reaches the C side must be pinned with
+  `runtime.Pinner` for the duration of the call: the goroutine stack can move
+  mid-call and the stack mover does not rewrite addresses laundered through
+  `unsafe.Pointer`. Scope one `Pinner` per C call. See `litert/ffi.go`.
 
 **Module:** `github.com/vladimirvivien/litert-go` · **Go:** 1.26.2
 
@@ -33,85 +31,78 @@ Pinner and pins its argument slots; see the convention note in `litert/ffi.go`.
 
 ```
 litert/        no-CGO binding to the LiteRT C API (purego + jupiterrider/ffi)
-  ffi.go         library loading, lazy symbol resolution, helpers
-  bindings.go    one lazyFun per bound C entry point (~30 symbols)
-  litert.go      typed wrappers + enums: Environment, Options, Model,
-                 Signature, CompiledModel, TensorBuffer
+  ffi.go         library loading, lazy symbol resolution, runtime.Pinner convention
+  bindings.go    one lazyFun per bound C entry point
+  litert.go      typed wrappers + enums: Environment, Options, Model, Signature,
+                 CompiledModel, TensorBuffer
+  run.go         Runner — repeated Run over a fixed buffer set, arguments pinned once
 litertlm/      .litertlm container reader (minimal FlatBuffer parser)
   litertlm.go    Sections / SectionTFLite / SectionBytes — extract sections
   metadata.go    ReadMetadata — model family + max tokens (protobuf scan)
-cmd/spike/     Phase 0 harness: extract, signature dump, compile, smoke run
+cmd/decode/    text → prefill → greedy decode → text
+cmd/spike/     signature dump, compile, and smoke-run a single signature
+cmd/repro/     ffi argument-pinning regression guard
 ```
 
 The binding targets the canonical LiteRT C API in `google-ai-edge/litert`
-(cloned at `~/DEV/litert`, headers under `litert/c/`, API v0.1.0) — **not** the
-copy vendored inside LiteRT-LM, whose `LiteRtCreateModelFrom*` functions lack the
-leading `environment` argument.
+(headers under `litert/c/`, API v0.1.0) — not the copy vendored inside LiteRT-LM,
+whose `LiteRtCreateModelFrom*` functions lack the leading `environment` argument.
 
 ## Prerequisites
 
 - **`libLiteRt`** shared library, built from `google-ai-edge/litert`:
-  - Windows: `bazelisk --output_base=C:/bzlt build //litert/c:libLiteRt --config=windows`
-    → `bazel-bin/litert/c/libLiteRt.dll`
+  - Windows: `bazelisk build //litert/c:libLiteRt --config=windows` → `bazel-bin/litert/c/libLiteRt.dll`
   - Linux/macOS: `//litert/c:litert_runtime_c_api_so` → `libLiteRt.so` / `.dylib`
 
   Point to its directory with `LITERT_LIB` or the `-lib` flag.
-- **A model** — pass a `.litertlm` container directly (the harness extracts the
-  embedded TFLite section) or a raw `.tflite`, via `-model`.
+- **A model** — a `.litertlm` container (the embedded TFLite section is extracted)
+  or a raw `.tflite`, via `-model`.
 
-## Running the spike
+## Usage
 
-Dump the signature contract (no library compile, no GPU required):
+Decode text:
 
 ```
-spike -lib /abs/path/to/litert/lib -model /abs/path/to/model.tflite
+decode -lib /path/to/libLiteRt -model model.litertlm -text "The capital of France is" -n 16
 ```
 
-This prints each signature (`prefill`, `decode`, …) with its input/output tensor
-names, element types, and shapes — the Phase 0a discovery (including whether the
-model consumes token IDs or embeddings).
+`-text` uses the model's embedded SentencePiece tokenizer; `-prompt` takes
+comma-separated token IDs instead. `-n` caps the number of generated tokens.
 
-Compile and report accelerator coverage:
+`-chat` wraps `-text` in the model's chat template, read from the container's
+`LlmMetadata` (`prompt_templates` affixes plus `start_token` / `stop_tokens`),
+and stops decoding on the model's turn-end token:
+
+```
+decode -lib /path/to/libLiteRt -model model.litertlm -chat -text "What is the capital of France?"
+```
+
+Containers that carry only a Jinja template (e.g. Gemma 4) fall back to the
+documented fixed affixes for that family, keyed on `llm_model_type`.
+
+Dump a model's signatures (names, element types, shapes):
+
+```
+spike -lib /path/to/libLiteRt -model model.tflite
+```
+
+Compile and report accelerator coverage, or smoke-run one signature with zeroed
+inputs (`fully accelerated: true` means a backend owns the whole graph with no
+CPU fallback):
 
 ```
 spike -lib ... -model ... -backend cpu
-spike -lib ... -model ... -backend gpu      # Phase 0b: reports fully-accelerated
-```
-
-Prove the call path end to end (zeroed inputs — the logits are meaningless):
-
-```
+spike -lib ... -model ... -backend gpu
 spike -lib ... -model ... -backend cpu -smoke -sig decode
 ```
 
-## What the spike validates
+## Limitations
 
-- **0a** — purego can load, introspect, compile, allocate buffers, and run a
-  signature; the signature contract is readable.
-- **0b** — whether a GPU backend fully owns the graph (`fully accelerated: true`)
-  or falls back to CPU.
-
-## Run path (Phase 1)
-
-Introspection and compile are proven. The decode/prefill signatures use dynamic
-dims (encoded as `0` in these models), so buffers can't be allocated until the
-inputs are made concrete. `ResizeInput` (NonStrict) is bound, but a correct run
-needs the model's real shape protocol — the executor's `dyn_shape_resolver`
-(replace dynamic dims, value from prefill length / step) plus per-step KV-cache
-growth (`ResizeKVCacheTensorBuffer`). The `-smoke` path resizes dynamic dims to 1
-and reaches buffer allocation; the actual greedy decode with KV-cache wiring and
-an oracle comparison is Phase 1.
-
-## Not yet wired (post-scaffold)
-
-- the tokenizer (feed/compare token IDs via `litertlm-go`)
-- correct dynamic-shape resolution + KV-cache management for a real decode step
-- OpenCL GPU-backend selection (needs the GPU opaque options bound)
-- selecting a specific section in multi-section containers (Gemma 3n/4, MTP,
-  adapters); the harness extracts the first `TFLiteModel` section
-
-These are the executor components described in
-`~/DEV/project-planning/litert-go/litert-go-proposal.md`.
+- CPU only. `-backend gpu` selects LiteRT's default GPU backend; forcing the
+  OpenCL backend needs opaque GPU options that are not bound.
+- Greedy decode only — no temperature/top-k/top-p sampling or speculative decoding.
+- Multi-section containers (Gemma 3n/4, MTP, adapters) use the first `TFLiteModel`
+  section.
 
 ## Build
 
@@ -131,3 +122,10 @@ LITERTLM_BENCH_FILE=/abs/path/model.litertlm go test ./litertlm -bench . -benchm
 `BenchmarkSections` / `BenchmarkSectionTFLite` measure the in-memory parser;
 `BenchmarkReadTFLite` measures the full load (file read + parse) with throughput
 over file size.
+
+The `litert` ffi-call benchmarks are gated on `LITERT_LIB` plus a model in
+`LITERT_BENCH_MODEL`:
+
+```
+go test ./litert -bench . -benchmem
+```

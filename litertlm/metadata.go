@@ -43,10 +43,65 @@ func (m ModelType) String() string {
 	}
 }
 
+// Affixes wraps a role's content for a chat turn: Prefix is prepended and
+// Suffix appended. Mirrors LlmMetadata.PromptAffixes.
+type Affixes struct {
+	Prefix string
+	Suffix string
+}
+
+// PromptTemplates holds the per-role chat affixes from
+// LlmMetadata.prompt_templates.
+type PromptTemplates struct {
+	User   Affixes
+	Model  Affixes
+	System Affixes
+}
+
+// Token references a token either by explicit IDs or by a string to be looked
+// up in the tokenizer. Mirrors LlmMetadata.TokenUnion: control tokens (e.g. a
+// BOS that has no round-tripping string) are carried as IDs, user-defined
+// markers as strings. Exactly one form is populated.
+type Token struct {
+	IDs []int32
+	Str string
+}
+
 // Metadata holds the LlmMetadata fields the executor needs to format prompts.
 type Metadata struct {
 	ModelType    ModelType
 	MaxNumTokens int
+	StartToken   Token           // field 1: prepended to the input sequence
+	StopTokens   []Token         // field 2: end-of-output markers
+	Prompts      PromptTemplates // field 3
+	HasPrompts   bool            // whether prompt_templates was present
+}
+
+// Templates returns the chat affixes for the model: the container's
+// prompt_templates when present, otherwise the documented per-family fallback
+// for containers that ship only a Jinja template (e.g. gemma4). ok is false
+// when neither is available.
+func (m Metadata) Templates() (PromptTemplates, bool) {
+	if m.HasPrompts {
+		return m.Prompts, true
+	}
+	return FallbackTemplates(m.ModelType)
+}
+
+// FallbackTemplates returns the fixed chat format for a family whose container
+// carries only a Jinja template (no prompt_templates field). Gemma 4 uses the
+// <|turn> / <turn|> markers (a fixed structure per the Gemma 4 prompt-format
+// docs, not Jinja).
+func FallbackTemplates(mt ModelType) (PromptTemplates, bool) {
+	switch mt {
+	case ModelGemma4:
+		return PromptTemplates{
+			User:   Affixes{Prefix: "<|turn>user\n", Suffix: "<turn|>\n"},
+			Model:  Affixes{Prefix: "<|turn>model\n", Suffix: "<turn|>\n"},
+			System: Affixes{Prefix: "<|turn>system\n", Suffix: "<turn|>\n"},
+		}, true
+	}
+	return PromptTemplates{}, false
 }
 
 // ReadMetadata parses the LlmMetadataProto section of a .litertlm container.
@@ -61,8 +116,9 @@ func ReadMetadata(file []byte) (Metadata, error) {
 	return parseMetadata(sec), nil
 }
 
-// parseMetadata scans an LlmMetadata message: max_num_tokens = field 5 (varint),
-// llm_model_type = field 6 (sub-message holding the family oneof).
+// parseMetadata scans an LlmMetadata message: start_token = field 1, stop_tokens
+// = field 2 (repeated), prompt_templates = field 3, max_num_tokens = field 5
+// (varint), llm_model_type = field 6 (sub-message holding the family oneof).
 func parseMetadata(sec []byte) Metadata {
 	var m Metadata
 	r := pb{b: sec}
@@ -72,6 +128,13 @@ func parseMetadata(sec []byte) Metadata {
 			break
 		}
 		switch {
+		case field == 1 && wire == 2:
+			m.StartToken = parseTokenUnion(data)
+		case field == 2 && wire == 2:
+			m.StopTokens = append(m.StopTokens, parseTokenUnion(data))
+		case field == 3 && wire == 2:
+			m.Prompts = parsePromptTemplates(data)
+			m.HasPrompts = true
 		case field == 5 && wire == 0:
 			m.MaxNumTokens = int(v)
 		case field == 6 && wire == 2:
@@ -79,6 +142,100 @@ func parseMetadata(sec []byte) Metadata {
 		}
 	}
 	return m
+}
+
+// parseTokenUnion reads a TokenUnion: token_ids = field 1 (a TokenIds
+// sub-message), token_str = field 2 (string).
+func parseTokenUnion(b []byte) Token {
+	var t Token
+	r := pb{b: b}
+	for {
+		field, wire, _, data, ok := r.next()
+		if !ok {
+			break
+		}
+		switch {
+		case field == 1 && wire == 2:
+			t.IDs = parseTokenIDs(data)
+		case field == 2 && wire == 2:
+			t.Str = string(data)
+		}
+	}
+	return t
+}
+
+// parseTokenIDs reads TokenIds.ids = field 1 (repeated int32), accepting both
+// the packed (proto3 default) and unpacked encodings.
+func parseTokenIDs(b []byte) []int32 {
+	var ids []int32
+	r := pb{b: b}
+	for {
+		field, wire, v, data, ok := r.next()
+		if !ok {
+			break
+		}
+		if field != 1 {
+			continue
+		}
+		switch wire {
+		case 0:
+			ids = append(ids, int32(v))
+		case 2:
+			p := pb{b: data}
+			for {
+				x, vok := p.varint()
+				if !vok {
+					break
+				}
+				ids = append(ids, int32(x))
+			}
+		}
+	}
+	return ids
+}
+
+func parsePromptTemplates(b []byte) PromptTemplates {
+	var pt PromptTemplates
+	r := pb{b: b}
+	for {
+		field, wire, _, data, ok := r.next()
+		if !ok {
+			break
+		}
+		if wire != 2 {
+			continue
+		}
+		switch field {
+		case 1:
+			pt.User = parseAffixes(data)
+		case 2:
+			pt.Model = parseAffixes(data)
+		case 3:
+			pt.System = parseAffixes(data)
+		}
+	}
+	return pt
+}
+
+func parseAffixes(b []byte) Affixes {
+	var a Affixes
+	r := pb{b: b}
+	for {
+		field, wire, _, data, ok := r.next()
+		if !ok {
+			break
+		}
+		if wire != 2 {
+			continue
+		}
+		switch field {
+		case 1:
+			a.Prefix = string(data)
+		case 2:
+			a.Suffix = string(data)
+		}
+	}
+	return a
 }
 
 // modelTypeFromOneof returns the set field of the LlmModelType oneof. Exactly

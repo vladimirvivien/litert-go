@@ -36,6 +36,7 @@ func main() {
 	text := flag.String("text", "", "text prompt (uses the model's embedded SentencePiece tokenizer)")
 	promptCSV := flag.String("prompt", "", "prompt token IDs, comma-separated (alternative to -text)")
 	ngen := flag.Int("n", 16, "max number of tokens to generate")
+	chat := flag.Bool("chat", false, "wrap -text in the model's chat template (from container metadata)")
 	flag.Parse()
 
 	if *modelPath == "" || (*text == "" && *promptCSV == "") {
@@ -43,7 +44,7 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
-	if err := run(*libDir, *modelPath, *text, *promptCSV, *ngen); err != nil {
+	if err := run(*libDir, *modelPath, *text, *promptCSV, *ngen, *chat); err != nil {
 		fmt.Fprintln(os.Stderr, "decode:", err)
 		os.Exit(1)
 	}
@@ -104,7 +105,7 @@ func loadSig(m litert.Model, idx int) (sig, error) {
 
 func isKV(name string) bool { return strings.HasPrefix(name, "kv_cache_") }
 
-func run(libDir, modelPath, text, promptCSV string, ngen int) error {
+func run(libDir, modelPath, text, promptCSV string, ngen int, chat bool) error {
 	if err := litert.Load(libDir); err != nil {
 		return err
 	}
@@ -120,10 +121,12 @@ func run(libDir, modelPath, text, promptCSV string, ngen int) error {
 	}
 	tflite := fileBytes
 	var tok *sentencepiece.Processor
+	var md litertlm.Metadata
 	if litertlm.IsContainer(fileBytes) {
 		if tflite, err = litertlm.SectionTFLite(fileBytes); err != nil {
 			return err
 		}
+		md, _ = litertlm.ReadMetadata(fileBytes)
 		if sp, e := litertlm.SectionBytes(fileBytes, litertlm.SectionSPTokenizer); e == nil {
 			if tok, err = sentencepiece.NewProcessor(bytes.NewReader(sp)); err != nil {
 				return fmt.Errorf("load tokenizer: %w", err)
@@ -190,7 +193,7 @@ func run(libDir, modelPath, text, promptCSV string, ngen int) error {
 		kv[name] = buf
 	}
 
-	prompt, err := buildPrompt(tok, text, promptCSV)
+	prompt, err := buildPrompt(tok, md, text, promptCSV, chat)
 	if err != nil {
 		return err
 	}
@@ -210,10 +213,7 @@ func run(libDir, modelPath, text, promptCSV string, ngen int) error {
 	}
 	defer dec.close()
 
-	eos := -1
-	if tok != nil {
-		eos = tok.ModelInfo().EndOfSentenceID
-	}
+	stop := stopSet(tok, md)
 	next := prompt[p]
 	pos := p
 	var gen []int
@@ -222,7 +222,7 @@ func run(libDir, modelPath, text, promptCSV string, ngen int) error {
 		if err != nil {
 			return fmt.Errorf("decode step %d: %w", g, err)
 		}
-		if int(id) == eos {
+		if stop[id] {
 			break
 		}
 		gen = append(gen, int(id))
@@ -238,23 +238,88 @@ func run(libDir, modelPath, text, promptCSV string, ngen int) error {
 	return nil
 }
 
-// buildPrompt produces prompt token IDs from -text (via the SentencePiece
-// tokenizer, prefixed with the beginning-of-sentence token) or from -prompt.
-func buildPrompt(tok *sentencepiece.Processor, text, promptCSV string) ([]int32, error) {
-	if text != "" {
-		if tok == nil {
-			return nil, fmt.Errorf("model has no SentencePiece tokenizer; use -prompt with token IDs")
-		}
-		ids := []int32{int32(tok.ModelInfo().BeginningOfSentenceID)}
-		for _, t := range tok.Encode(text) {
-			ids = append(ids, int32(t.ID))
-		}
-		if len(ids) < 2 {
-			return nil, fmt.Errorf("empty tokenization of %q", text)
-		}
-		return ids, nil
+// buildPrompt produces prompt token IDs. With -prompt it parses raw IDs; with
+// -text it tokenizes through the embedded SentencePiece tokenizer — as a raw
+// completion (start token + text), or, with chat set, wrapped in the model's
+// chat template from the container metadata.
+func buildPrompt(tok *sentencepiece.Processor, md litertlm.Metadata, text, promptCSV string, chat bool) ([]int32, error) {
+	if promptCSV != "" {
+		return parseIDs(promptCSV)
 	}
-	return parseIDs(promptCSV)
+	if tok == nil {
+		return nil, fmt.Errorf("model has no SentencePiece tokenizer; use -prompt with token IDs")
+	}
+	if chat {
+		return buildChatPrompt(tok, md, text)
+	}
+	ids := startIDs(tok, md)
+	for _, t := range tok.Encode(text) {
+		ids = append(ids, int32(t.ID))
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("empty tokenization of %q", text)
+	}
+	return ids, nil
+}
+
+// buildChatPrompt wraps userText in the model's single user turn:
+// start ++ user.prefix ++ userText ++ user.suffix ++ model.prefix. The turn
+// markers in the affixes (e.g. <start_of_turn>) are user-defined tokenizer
+// pieces, so encoding the rendered string yields their single vocab IDs.
+func buildChatPrompt(tok *sentencepiece.Processor, md litertlm.Metadata, userText string) ([]int32, error) {
+	tpl, ok := md.Templates()
+	if !ok {
+		return nil, fmt.Errorf("no chat template for model type %q; use -text without -chat, or -prompt", md.ModelType)
+	}
+	ids := startIDs(tok, md)
+	rendered := tpl.User.Prefix + userText + tpl.User.Suffix + tpl.Model.Prefix
+	for _, t := range tok.Encode(rendered) {
+		ids = append(ids, int32(t.ID))
+	}
+	if len(ids) < 2 {
+		return nil, fmt.Errorf("empty chat tokenization of %q", userText)
+	}
+	return ids, nil
+}
+
+// startIDs returns the start token IDs to prepend: the metadata start_token when
+// given as IDs, none for the "None" sentinel, otherwise the tokenizer's BOS when
+// it has one.
+func startIDs(tok *sentencepiece.Processor, md litertlm.Metadata) []int32 {
+	if len(md.StartToken.IDs) > 0 {
+		return append([]int32(nil), md.StartToken.IDs...)
+	}
+	if md.StartToken.Str == "None" {
+		return nil
+	}
+	if bos := tok.ModelInfo().BeginningOfSentenceID; bos >= 0 {
+		return []int32{int32(bos)}
+	}
+	return nil
+}
+
+// stopSet collects the token IDs that end generation: the metadata stop_tokens
+// (IDs directly, single-token strings resolved through the tokenizer) plus the
+// tokenizer's end-of-sentence token. Multi-token stop strings are skipped.
+func stopSet(tok *sentencepiece.Processor, md litertlm.Metadata) map[int32]bool {
+	set := map[int32]bool{}
+	if tok == nil {
+		return set
+	}
+	for _, st := range md.StopTokens {
+		for _, id := range st.IDs {
+			set[id] = true
+		}
+		if st.Str != "" {
+			if enc := tok.Encode(st.Str); len(enc) == 1 {
+				set[int32(enc[0].ID)] = true
+			}
+		}
+	}
+	if eos := tok.ModelInfo().EndOfSentenceID; eos >= 0 {
+		set[int32(eos)] = true
+	}
+	return set
 }
 
 func prefillStep(env litert.Environment, cm litert.CompiledModel, g sig, kv map[string]litert.TensorBuffer, ids []int32) error {
