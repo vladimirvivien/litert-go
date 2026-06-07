@@ -1,7 +1,9 @@
 # litert-go
 
 A no-CGO Go binding for the **LiteRT CompiledModel C API**, with a Go-driven LLM
-decode runtime (prefill, fixed-context KV cache, greedy decode) built on top.
+decode runtime (bucketed prefill, fixed-context KV cache, greedy decode) built on
+top. Prompts longer than a single prefill bucket are chunked across buckets at
+increasing positions, up to the model's KV-cache context length.
 
 `cmd/decode` runs the full pipeline on CPU: text → SentencePiece tokenizer
 (pure-Go `eliben/go-sentencepiece`, loaded from the `.litertlm`'s embedded
@@ -163,6 +165,10 @@ spike -lib ... -model ... -backend cpu -smoke -sig decode
   greedy-only and exact (greedy-equivalent output), accepting multiple tokens
   per verify pass — but CPU break-even: the wide verify pass costs ~K× a decode
   on CPU, so the win needs a GPU backend (where it parallelizes).
+- Context is bounded by the model's KV-cache size (e.g. 4096 for gemma3-1b).
+  Prefill covers the prompt by chunking across the model's prefill buckets — a
+  short prompt uses the smallest bucket that fits; a long one uses repeated
+  largest-bucket chunks plus a fitting remainder.
 - Text only. Both token-input models (gemma3, qwen3, …) and embedding-input
   models (Gemma 3n/4, which run separate text + per-layer embedder stages into
   the main graph) are supported. `-repl` is interactive multi-turn chat over a

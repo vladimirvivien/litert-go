@@ -217,7 +217,7 @@ func elemCount(g sig, name string, out bool) int {
 
 // decodeSpeculative runs MTP speculative decoding on an embedding-input model
 // that has a verify signature and an mtp_drafter section.
-func decodeSpeculative(env litert.Environment, cm litert.CompiledModel, fileBytes []byte, prefill, decode, verifySig sig, prompt []int32, ngen int, stop map[int32]bool, accel litert.HwAccelerator, onToken func(int32)) ([]int, error) {
+func decodeSpeculative(env litert.Environment, cm litert.CompiledModel, fileBytes []byte, pre prefiller, decode, verifySig sig, prompt []int32, ngen int, stop map[int32]bool, accel litert.HwAccelerator, onToken func(int32)) ([]int, error) {
 	opts, err := litert.NewOptions(accel)
 	if err != nil {
 		return nil, err
@@ -251,25 +251,18 @@ func decodeSpeculative(env litert.Environment, cm litert.CompiledModel, fileByte
 		return nil, fmt.Errorf("mtp drafter section: %w", err)
 	}
 
-	kv := map[string]litert.TensorBuffer{}
+	kv, err := allocKV(env, cm, pre.max())
+	if err != nil {
+		return nil, err
+	}
 	defer func() {
 		for _, b := range kv {
 			b.Close()
 		}
 	}()
-	for _, name := range prefill.inNames {
-		if !isKV(name) {
-			continue
-		}
-		buf, err := allocReqInput(env, cm, prefill, name)
-		if err != nil {
-			return nil, fmt.Errorf("alloc %s: %w", name, err)
-		}
-		kv[name] = buf
-	}
 
 	p := len(prompt) - 1
-	if err := prefillEmbed(env, cm, prefill, kv, emb, ple, prompt[:p], 0); err != nil {
+	if err := prefillEmbedRun(env, cm, pre, kv, emb, ple, prompt[:p], 0); err != nil {
 		return nil, fmt.Errorf("prefill: %w", err)
 	}
 

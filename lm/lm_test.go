@@ -95,6 +95,45 @@ func TestSessionMatchesGenerate(t *testing.T) {
 	}
 }
 
+// A prompt longer than the largest prefill bucket must be ingested by chunking
+// across buckets at increasing positions, not rejected. The reply must be
+// non-empty and deterministic (the chunk boundaries are not a source of
+// nondeterminism). Cross-chunk recall is logged, not asserted (model-dependent).
+func TestLongContextChunked(t *testing.T) {
+	eng := openEngine(t)
+	if !eng.HasChatTemplate() {
+		t.Skip("model has no chat template")
+	}
+	// ~3500 tokens of filler — past every model's largest prefill bucket — with a
+	// fact at the very start that only an early chunk holds.
+	var b strings.Builder
+	b.WriteString("Remember this secret code: 7492. ")
+	for i := 0; i < 350; i++ {
+		b.WriteString("The quick brown fox jumps over the lazy dog. ")
+	}
+	b.WriteString("\nWhat was the secret code? Reply with just the number.")
+	prompt := b.String()
+
+	o := lm.GenOptions{MaxTokens: 16}
+	out, err := eng.Generate(prompt, true, o)
+	if err != nil {
+		t.Fatalf("long prompt failed (chunked prefill should handle it): %v", err)
+	}
+	if out == "" {
+		t.Fatal("empty reply on long prompt")
+	}
+	again, err := eng.Generate(prompt, true, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != again {
+		t.Fatalf("chunked prefill not deterministic:\n  %q\n  %q", out, again)
+	}
+	if !strings.Contains(out, "7492") {
+		t.Logf("note: cross-chunk recall missed (model-dependent): %q", out)
+	}
+}
+
 // The same seed must give the same sampled output.
 func TestSeededSamplingDeterministic(t *testing.T) {
 	eng := openEngine(t)

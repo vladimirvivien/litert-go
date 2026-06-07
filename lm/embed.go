@@ -98,7 +98,7 @@ func (e *embedModel) close() {
 // decodeEmbeddingInput runs the gemma 3n/4 pipeline: compile the embedder
 // stage(s) from the container, allocate the i8 KV cache, prefill all but the
 // last prompt token, then greedily decode from the held-back token.
-func decodeEmbeddingInput(env litert.Environment, cm litert.CompiledModel, fileBytes []byte, prefill, decode sig, prompt []int32, ngen int, stop map[int32]bool, accel litert.HwAccelerator, smp *sampler, onToken func(int32)) ([]int, error) {
+func decodeEmbeddingInput(env litert.Environment, cm litert.CompiledModel, fileBytes []byte, pre prefiller, decode sig, prompt []int32, ngen int, stop map[int32]bool, accel litert.HwAccelerator, smp *sampler, onToken func(int32)) ([]int, error) {
 	opts, err := litert.NewOptions(accel)
 	if err != nil {
 		return nil, err
@@ -127,25 +127,18 @@ func decodeEmbeddingInput(env litert.Environment, cm litert.CompiledModel, fileB
 		defer ple.close()
 	}
 
-	kv := map[string]litert.TensorBuffer{}
+	kv, err := allocKV(env, cm, pre.max())
+	if err != nil {
+		return nil, err
+	}
 	defer func() {
 		for _, b := range kv {
 			b.Close()
 		}
 	}()
-	for _, name := range prefill.inNames {
-		if !isKV(name) {
-			continue
-		}
-		buf, err := allocReqInput(env, cm, prefill, name)
-		if err != nil {
-			return nil, fmt.Errorf("alloc %s: %w", name, err)
-		}
-		kv[name] = buf
-	}
 
 	p := len(prompt) - 1
-	if err := prefillEmbed(env, cm, prefill, kv, emb, ple, prompt[:p], 0); err != nil {
+	if err := prefillEmbedRun(env, cm, pre, kv, emb, ple, prompt[:p], 0); err != nil {
 		return nil, fmt.Errorf("prefill: %w", err)
 	}
 
@@ -277,6 +270,19 @@ func prefillEmbed(env litert.Environment, cm litert.CompiledModel, g sig, kv map
 		}
 	}
 	return cm.Run(g.idx, in, out)
+}
+
+// prefillEmbedRun ingests ids into the KV cache starting at position start,
+// chunking across prefill buckets for prompts longer than one bucket.
+func prefillEmbedRun(env litert.Environment, cm litert.CompiledModel, pre prefiller, kv map[string]litert.TensorBuffer, emb, ple *embedModel, ids []int32, start int) error {
+	off := 0
+	for _, c := range pre.plan(len(ids)) {
+		if err := prefillEmbed(env, cm, pre.sig[c.bucket], kv, emb, ple, ids[off:off+c.take], start+off); err != nil {
+			return err
+		}
+		off += c.take
+	}
+	return nil
 }
 
 // fillEmbedInput writes one non-KV prefill/decode input by name. steps rows of
@@ -435,7 +441,7 @@ func (e *Engine) newEmbedSession(o GenOptions) (*embedSession, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &embedSession{e: e, o: o, tpl: tpl, stop: stopSet(e.tok, e.md), opts: opts, kv: map[string]litert.TensorBuffer{}}
+	s := &embedSession{e: e, o: o, tpl: tpl, stop: stopSet(e.tok, e.md), opts: opts}
 	done := false
 	defer func() {
 		if !done {
@@ -460,15 +466,8 @@ func (e *Engine) newEmbedSession(o GenOptions) (*embedSession, error) {
 		}
 	}
 
-	for _, name := range e.prefill.inNames {
-		if !isKV(name) {
-			continue
-		}
-		buf, err := allocReqInput(e.env, e.cm, e.prefill, name)
-		if err != nil {
-			return nil, fmt.Errorf("alloc %s: %w", name, err)
-		}
-		s.kv[name] = buf
+	if s.kv, err = allocKV(e.env, e.cm, e.pre.max()); err != nil {
+		return nil, err
 	}
 	if s.dec, err = newEmbedDecoder(e.env, e.cm, e.decode, s.kv, s.emb, s.ple, newSampler(o.Temp, o.TopK, o.TopP, o.Seed)); err != nil {
 		return nil, err
@@ -526,7 +525,7 @@ func (s *embedSession) send(userText string, onPiece func(string)) (string, erro
 	// graph then feeds the held-back token, whose logits start the reply.
 	p := len(ids) - 1
 	if p > 0 {
-		if err := prefillEmbed(s.e.env, s.e.cm, s.e.prefill, s.kv, s.emb, s.ple, ids[:p], s.pos); err != nil {
+		if err := prefillEmbedRun(s.e.env, s.e.cm, s.e.pre, s.kv, s.emb, s.ple, ids[:p], s.pos); err != nil {
 			return "", fmt.Errorf("prefill: %w", err)
 		}
 	}

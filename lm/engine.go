@@ -14,6 +14,7 @@ import (
 	"math"
 	"os"
 	"runtime"
+	"sort"
 	"strings"
 	"unsafe"
 
@@ -35,7 +36,7 @@ type Engine struct {
 	tok        *sentencepiece.Processor
 	md         litertlm.Metadata
 	fileBytes  []byte
-	prefill    sig
+	pre        prefiller
 	decode     sig
 	verify     sig
 	haveVerify bool
@@ -83,7 +84,7 @@ func Open(libDir, modelPath string, accel litert.HwAccelerator) (*Engine, error)
 	}
 
 	nsig, _ := e.model.NumSignatures()
-	var havePrefill, haveDecode bool
+	haveDecode := false
 	for i := 0; i < nsig; i++ {
 		s, _ := e.model.Signature(i)
 		key, _ := s.Key()
@@ -98,16 +99,20 @@ func Open(libDir, modelPath string, accel litert.HwAccelerator) (*Engine, error)
 				return nil, err
 			}
 			e.haveVerify = true
-		case strings.HasPrefix(key, "prefill") && !havePrefill:
-			if e.prefill, err = loadSig(e.model, i); err != nil {
+		case strings.HasPrefix(key, "prefill"):
+			g, err := loadSig(e.model, i)
+			if err != nil {
 				return nil, err
 			}
-			havePrefill = true
+			if err := e.pre.add(g); err != nil {
+				return nil, err
+			}
 		}
 	}
-	if !havePrefill || !haveDecode {
+	if e.pre.empty() || !haveDecode {
 		return nil, fmt.Errorf("lm: model lacks prefill/decode signatures")
 	}
+	e.pre.sortSizes()
 
 	if e.opts, err = litert.NewOptions(accel); err != nil {
 		return nil, err
@@ -225,11 +230,11 @@ func (e *Engine) generate(prompt []int32, o GenOptions, onToken func(int32)) ([]
 	stop := stopSet(e.tok, e.md)
 	switch {
 	case o.Spec && e.SupportsSpec():
-		return decodeSpeculative(e.env, e.cm, e.fileBytes, e.prefill, e.decode, e.verify, prompt, o.MaxTokens, stop, e.accel, onToken)
+		return decodeSpeculative(e.env, e.cm, e.fileBytes, e.pre, e.decode, e.verify, prompt, o.MaxTokens, stop, e.accel, onToken)
 	case sigHasInput(e.decode, "embeddings"):
-		return decodeEmbeddingInput(e.env, e.cm, e.fileBytes, e.prefill, e.decode, prompt, o.MaxTokens, stop, e.accel, smp, onToken)
+		return decodeEmbeddingInput(e.env, e.cm, e.fileBytes, e.pre, e.decode, prompt, o.MaxTokens, stop, e.accel, smp, onToken)
 	default:
-		return decodeTokenInput(e.env, e.cm, e.prefill, e.decode, prompt, o.MaxTokens, stop, smp, onToken)
+		return decodeTokenInput(e.env, e.cm, e.pre, e.decode, prompt, o.MaxTokens, stop, smp, onToken)
 	}
 }
 
@@ -344,18 +349,11 @@ func (e *Engine) NewSession(o GenOptions) (*Session, error) {
 	if !ok {
 		return nil, fmt.Errorf("lm: model has no chat template (model type %q)", e.md.ModelType)
 	}
-	s := &Session{e: e, o: o, tpl: tpl, stop: stopSet(e.tok, e.md), kv: map[string]litert.TensorBuffer{}}
-	for _, name := range e.prefill.inNames {
-		if !isKV(name) {
-			continue
-		}
-		buf, err := allocReqInput(e.env, e.cm, e.prefill, name)
-		if err != nil {
-			s.Close()
-			return nil, fmt.Errorf("alloc %s: %w", name, err)
-		}
-		s.kv[name] = buf
+	kv, err := allocKV(e.env, e.cm, e.pre.max())
+	if err != nil {
+		return nil, err
 	}
+	s := &Session{e: e, o: o, tpl: tpl, stop: stopSet(e.tok, e.md), kv: kv}
 	dec, err := newDecoder(e.env, e.cm, e.decode, s.kv, newSampler(o.Temp, o.TopK, o.TopP, o.Seed))
 	if err != nil {
 		s.Close()
@@ -494,6 +492,114 @@ func inputShape(g sig, name string) ([]int32, error) {
 	return tt.Shape, nil
 }
 
+// --- prefill bucketing ---
+
+// prefiller is a model's set of prefill signatures, keyed by sequence-length
+// bucket (the size of the tokens/embeddings input). A prompt longer than a
+// single bucket is covered by several prefill calls at increasing positions; a
+// short prompt uses the smallest bucket that fits.
+type prefiller struct {
+	sizes []int // ascending
+	sig   map[int]sig
+}
+
+// prefillChunk is one prefill call in a plan: a bucket signature of size bucket
+// fed take real tokens (take <= bucket; the rest of the bucket is padding).
+type prefillChunk struct {
+	bucket int
+	take   int
+}
+
+func (p *prefiller) add(g sig) error {
+	size, err := bucketSize(g)
+	if err != nil {
+		return err
+	}
+	if p.sig == nil {
+		p.sig = map[int]sig{}
+	}
+	if _, dup := p.sig[size]; !dup {
+		p.sizes = append(p.sizes, size)
+		p.sig[size] = g
+	}
+	return nil
+}
+
+func (p *prefiller) sortSizes() { sort.Ints(p.sizes) }
+func (p prefiller) empty() bool { return len(p.sizes) == 0 }
+
+// max returns the largest-bucket signature. Its KV-cache inputs are shared by
+// every bucket, so it is used to allocate the cache.
+func (p prefiller) max() sig { return p.sig[p.sizes[len(p.sizes)-1]] }
+
+// plan splits n tokens into chunks: repeated max-bucket chunks for the bulk,
+// then the smallest bucket that fits the remainder.
+func (p prefiller) plan(n int) []prefillChunk {
+	maxSize := p.sizes[len(p.sizes)-1]
+	var plan []prefillChunk
+	for n > 0 {
+		if n >= maxSize {
+			plan = append(plan, prefillChunk{maxSize, maxSize})
+			n -= maxSize
+			continue
+		}
+		bucket := maxSize
+		for _, s := range p.sizes {
+			if s >= n {
+				bucket = s
+				break
+			}
+		}
+		plan = append(plan, prefillChunk{bucket, n})
+		n = 0
+	}
+	return plan
+}
+
+// bucketSize reads a prefill signature's sequence-length bucket from its token
+// or embedding input shape ([1, bucket] or [1, bucket, H]).
+func bucketSize(g sig) (int, error) {
+	for _, name := range []string{"tokens", "embeddings"} {
+		if sh, err := inputShape(g, name); err == nil && len(sh) >= 2 {
+			return int(sh[1]), nil
+		}
+	}
+	return 0, fmt.Errorf("prefill signature has no tokens/embeddings input")
+}
+
+// allocKV allocates a zeroed buffer for every KV-cache input of g, keyed by
+// name. The cache is shared across prefill, decode, and verify.
+func allocKV(env litert.Environment, cm litert.CompiledModel, g sig) (map[string]litert.TensorBuffer, error) {
+	kv := map[string]litert.TensorBuffer{}
+	for _, name := range g.inNames {
+		if !isKV(name) {
+			continue
+		}
+		buf, err := allocReqInput(env, cm, g, name)
+		if err != nil {
+			for _, b := range kv {
+				b.Close()
+			}
+			return nil, fmt.Errorf("alloc %s: %w", name, err)
+		}
+		kv[name] = buf
+	}
+	return kv, nil
+}
+
+// prefillTokenRun ingests ids into the KV cache starting at position start,
+// chunking across prefill buckets for prompts longer than one bucket.
+func prefillTokenRun(env litert.Environment, cm litert.CompiledModel, pre prefiller, kv map[string]litert.TensorBuffer, ids []int32, start int) error {
+	off := 0
+	for _, c := range pre.plan(len(ids)) {
+		if err := prefillStep(env, cm, pre.sig[c.bucket], kv, ids[off:off+c.take], start+off); err != nil {
+			return err
+		}
+		off += c.take
+	}
+	return nil
+}
+
 // --- prompt building ---
 
 // turn is one message in a multi-turn conversation.
@@ -614,26 +720,19 @@ func stopSet(tok *sentencepiece.Processor, md litertlm.Metadata) map[int32]bool 
 // decodeTokenInput runs the static token-input pipeline (gemma3, qwen3, …):
 // allocate the KV cache once, prefill all but the last prompt token, then
 // decode from the held-back token.
-func decodeTokenInput(env litert.Environment, cm litert.CompiledModel, prefill, decode sig, prompt []int32, ngen int, stop map[int32]bool, smp *sampler, onToken func(int32)) ([]int, error) {
-	kv := map[string]litert.TensorBuffer{}
+func decodeTokenInput(env litert.Environment, cm litert.CompiledModel, pre prefiller, decode sig, prompt []int32, ngen int, stop map[int32]bool, smp *sampler, onToken func(int32)) ([]int, error) {
+	kv, err := allocKV(env, cm, pre.max())
+	if err != nil {
+		return nil, err
+	}
 	defer func() {
 		for _, b := range kv {
 			b.Close()
 		}
 	}()
-	for _, name := range prefill.inNames {
-		if !isKV(name) {
-			continue
-		}
-		buf, err := allocReqInput(env, cm, prefill, name)
-		if err != nil {
-			return nil, fmt.Errorf("alloc %s: %w", name, err)
-		}
-		kv[name] = buf
-	}
 
 	p := len(prompt) - 1
-	if err := prefillStep(env, cm, prefill, kv, prompt[:p]); err != nil {
+	if err := prefillTokenRun(env, cm, pre, kv, prompt[:p], 0); err != nil {
 		return nil, fmt.Errorf("prefill: %w", err)
 	}
 
@@ -664,7 +763,12 @@ func decodeTokenInput(env litert.Environment, cm litert.CompiledModel, prefill, 
 	return gen, nil
 }
 
-func prefillStep(env litert.Environment, cm litert.CompiledModel, g sig, kv map[string]litert.TensorBuffer, ids []int32) error {
+// prefillStep ingests ids into the KV cache at position start through bucket g:
+// the tokens fill the first len(ids) slots, input_pos runs [start, start+seq),
+// and a causal mask lets row r attend [0, start+r+1) so earlier chunks stay
+// visible. Bucket slots past len(ids) hold padding whose KV is later overwritten
+// or never attended.
+func prefillStep(env litert.Environment, cm litert.CompiledModel, g sig, kv map[string]litert.TensorBuffer, ids []int32, start int) error {
 	tokens, err := allocReqInput(env, cm, g, "tokens")
 	if err != nil {
 		return err
@@ -688,12 +792,12 @@ func prefillStep(env litert.Environment, cm litert.CompiledModel, g sig, kv map[
 	seq, ctx := int(maskShape[2]), int(maskShape[3])
 	posVals := make([]int32, seq)
 	for i := range posVals {
-		posVals[i] = int32(i)
+		posVals[i] = int32(start + i)
 	}
 	if err := writeInts(pos, posVals); err != nil {
 		return err
 	}
-	if err := fillCausalMask(mask, seq, ctx, 0); err != nil {
+	if err := fillCausalMask(mask, seq, ctx, start); err != nil {
 		return err
 	}
 
