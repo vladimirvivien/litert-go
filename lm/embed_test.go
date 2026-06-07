@@ -31,6 +31,47 @@ func openEmbedEngine(t *testing.T) *lm.Engine {
 	return eng
 }
 
+// Generate must be re-runnable on one Engine: the embedder stages are compiled
+// once and reused, so a second call neither fails nor changes output.
+func TestEmbedGenerateReentrant(t *testing.T) {
+	eng := openEmbedEngine(t)
+	o := lm.GenOptions{MaxTokens: 16}
+	a, err := eng.Generate("Name one primary color.", true, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := eng.Generate("Name one primary color.", true, o)
+	if err != nil {
+		t.Fatalf("second Generate failed (embedders must be reusable): %v", err)
+	}
+	if a != b {
+		t.Fatalf("Generate not deterministic across calls:\n  %q\n  %q", a, b)
+	}
+}
+
+// A re-prefill Chat must run multiple turns on an embedding model (each Send is
+// a fresh decodeEmbeddingInput over the re-rendered history).
+func TestEmbedChatMultiTurn(t *testing.T) {
+	eng := openEmbedEngine(t)
+	chat, err := eng.NewChat(lm.GenOptions{MaxTokens: 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer chat.Close()
+	if r1, err := chat.Send("My name is Vlad. Remember it."); err != nil {
+		t.Fatalf("turn 1: %v", err)
+	} else if r1 == "" {
+		t.Fatal("empty turn 1")
+	}
+	r2, err := chat.Send("What is my name?")
+	if err != nil {
+		t.Fatalf("turn 2: %v", err)
+	}
+	if r2 == "" {
+		t.Fatal("empty turn 2")
+	}
+}
+
 // Turn 1 of an embedding-input Session ingests the prompt with a
 // prefill-at-offset of 0 — the same prefill Generate runs — so its reply must
 // equal Generate's exactly.

@@ -41,7 +41,9 @@ type Engine struct {
 	verify     sig
 	haveVerify bool
 	accel      litert.HwAccelerator
-	lastText   string // most recent streamed output (GenerateStream/SendStream)
+	emb, ple   *embedModel    // text + per-layer embedder stages, compiled once on first use
+	embOpts    litert.Options // compile options backing emb/ple
+	lastText   string         // most recent streamed output (GenerateStream/SendStream)
 }
 
 // Open loads libLiteRt from libDir (or the LITERT_LIB environment variable),
@@ -126,6 +128,15 @@ func Open(libDir, modelPath string, accel litert.HwAccelerator) (*Engine, error)
 
 // Close releases the model, compiled model, and environment.
 func (e *Engine) Close() {
+	if e.emb != nil {
+		e.emb.close()
+	}
+	if e.ple != nil {
+		e.ple.close()
+	}
+	if e.embOpts != 0 {
+		e.embOpts.Close()
+	}
 	if e.cm != 0 {
 		e.cm.Close()
 	}
@@ -139,6 +150,47 @@ func (e *Engine) Close() {
 		e.env.Close()
 	}
 	runtime.KeepAlive(e.fileBytes)
+}
+
+// ensureEmbedders compiles the text embedder and, when the decode graph asks for
+// it, the per-layer embedder, caching both on the Engine. Embedding-input models
+// run every token through these stages, so they are compiled once and reused
+// across Generate, speculative decoding, and sessions. The Engine is not safe
+// for concurrent use, so the lazy initialization needs no lock.
+func (e *Engine) ensureEmbedders() (*embedModel, *embedModel, error) {
+	if e.emb != nil {
+		return e.emb, e.ple, nil
+	}
+	opts, err := litert.NewOptions(e.accel)
+	if err != nil {
+		return nil, nil, err
+	}
+	embSec, err := litertlm.SectionTFLiteModelType(e.fileBytes, litertlm.TFLiteEmbedder)
+	if err != nil {
+		opts.Close()
+		return nil, nil, fmt.Errorf("embedder section: %w", err)
+	}
+	emb, err := newEmbedModel(e.env, opts, embSec)
+	if err != nil {
+		opts.Close()
+		return nil, nil, fmt.Errorf("embedder: %w", err)
+	}
+	var ple *embedModel
+	if sigHasInput(e.decode, "per_layer_embeddings") {
+		pleSec, err := litertlm.SectionTFLiteModelType(e.fileBytes, litertlm.TFLitePerLayerEmbedder)
+		if err != nil {
+			emb.close()
+			opts.Close()
+			return nil, nil, fmt.Errorf("per-layer embedder section: %w", err)
+		}
+		if ple, err = newEmbedModel(e.env, opts, pleSec); err != nil {
+			emb.close()
+			opts.Close()
+			return nil, nil, fmt.Errorf("per-layer embedder: %w", err)
+		}
+	}
+	e.emb, e.ple, e.embOpts = emb, ple, opts
+	return emb, ple, nil
 }
 
 // Metadata returns the model's parsed LlmMetadata.
@@ -230,9 +282,17 @@ func (e *Engine) generate(prompt []int32, o GenOptions, onToken func(int32)) ([]
 	stop := stopSet(e.tok, e.md)
 	switch {
 	case o.Spec && e.SupportsSpec():
-		return decodeSpeculative(e.env, e.cm, e.fileBytes, e.pre, e.decode, e.verify, prompt, o.MaxTokens, stop, e.accel, onToken)
+		emb, ple, err := e.ensureEmbedders()
+		if err != nil {
+			return nil, err
+		}
+		return decodeSpeculative(e.env, e.cm, e.fileBytes, e.pre, e.decode, e.verify, emb, ple, prompt, o.MaxTokens, stop, e.accel, onToken)
 	case sigHasInput(e.decode, "embeddings"):
-		return decodeEmbeddingInput(e.env, e.cm, e.fileBytes, e.pre, e.decode, prompt, o.MaxTokens, stop, e.accel, smp, onToken)
+		emb, ple, err := e.ensureEmbedders()
+		if err != nil {
+			return nil, err
+		}
+		return decodeEmbeddingInput(e.env, e.cm, e.pre, e.decode, emb, ple, prompt, o.MaxTokens, stop, smp, onToken)
 	default:
 		return decodeTokenInput(e.env, e.cm, e.pre, e.decode, prompt, o.MaxTokens, stop, smp, onToken)
 	}

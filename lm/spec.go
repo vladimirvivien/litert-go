@@ -217,34 +217,12 @@ func elemCount(g sig, name string, out bool) int {
 
 // decodeSpeculative runs MTP speculative decoding on an embedding-input model
 // that has a verify signature and an mtp_drafter section.
-func decodeSpeculative(env litert.Environment, cm litert.CompiledModel, fileBytes []byte, pre prefiller, decode, verifySig sig, prompt []int32, ngen int, stop map[int32]bool, accel litert.HwAccelerator, onToken func(int32)) ([]int, error) {
+func decodeSpeculative(env litert.Environment, cm litert.CompiledModel, fileBytes []byte, pre prefiller, decode, verifySig sig, emb, ple *embedModel, prompt []int32, ngen int, stop map[int32]bool, accel litert.HwAccelerator, onToken func(int32)) ([]int, error) {
 	opts, err := litert.NewOptions(accel)
 	if err != nil {
 		return nil, err
 	}
 	defer opts.Close()
-
-	embSec, err := litertlm.SectionTFLiteModelType(fileBytes, litertlm.TFLiteEmbedder)
-	if err != nil {
-		return nil, fmt.Errorf("embedder section: %w", err)
-	}
-	emb, err := newEmbedModel(env, opts, embSec)
-	if err != nil {
-		return nil, fmt.Errorf("embedder: %w", err)
-	}
-	defer emb.close()
-
-	var ple *embedModel
-	if sigHasInput(decode, "per_layer_embeddings") {
-		pleSec, err := litertlm.SectionTFLiteModelType(fileBytes, litertlm.TFLitePerLayerEmbedder)
-		if err != nil {
-			return nil, fmt.Errorf("per-layer embedder section: %w", err)
-		}
-		if ple, err = newEmbedModel(env, opts, pleSec); err != nil {
-			return nil, fmt.Errorf("per-layer embedder: %w", err)
-		}
-		defer ple.close()
-	}
 
 	draftSec, err := litertlm.SectionTFLiteModelType(fileBytes, litertlm.TFLiteMTPDrafter)
 	if err != nil {

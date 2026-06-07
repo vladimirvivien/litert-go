@@ -95,38 +95,10 @@ func (e *embedModel) close() {
 	e.model.Close()
 }
 
-// decodeEmbeddingInput runs the gemma 3n/4 pipeline: compile the embedder
-// stage(s) from the container, allocate the i8 KV cache, prefill all but the
-// last prompt token, then greedily decode from the held-back token.
-func decodeEmbeddingInput(env litert.Environment, cm litert.CompiledModel, fileBytes []byte, pre prefiller, decode sig, prompt []int32, ngen int, stop map[int32]bool, accel litert.HwAccelerator, smp *sampler, onToken func(int32)) ([]int, error) {
-	opts, err := litert.NewOptions(accel)
-	if err != nil {
-		return nil, err
-	}
-	defer opts.Close()
-
-	embSec, err := litertlm.SectionTFLiteModelType(fileBytes, litertlm.TFLiteEmbedder)
-	if err != nil {
-		return nil, fmt.Errorf("embedder section: %w", err)
-	}
-	emb, err := newEmbedModel(env, opts, embSec)
-	if err != nil {
-		return nil, fmt.Errorf("embedder: %w", err)
-	}
-	defer emb.close()
-
-	var ple *embedModel
-	if sigHasInput(decode, "per_layer_embeddings") {
-		pleSec, err := litertlm.SectionTFLiteModelType(fileBytes, litertlm.TFLitePerLayerEmbedder)
-		if err != nil {
-			return nil, fmt.Errorf("per-layer embedder section: %w", err)
-		}
-		if ple, err = newEmbedModel(env, opts, pleSec); err != nil {
-			return nil, fmt.Errorf("per-layer embedder: %w", err)
-		}
-		defer ple.close()
-	}
-
+// decodeEmbeddingInput runs the gemma 3n/4 pipeline: allocate the i8 KV cache,
+// prefill all but the last prompt token through the shared embedder stages, then
+// greedily decode from the held-back token.
+func decodeEmbeddingInput(env litert.Environment, cm litert.CompiledModel, pre prefiller, decode sig, emb, ple *embedModel, prompt []int32, ngen int, stop map[int32]bool, smp *sampler, onToken func(int32)) ([]int, error) {
 	kv, err := allocKV(env, cm, pre.max())
 	if err != nil {
 		return nil, err
@@ -417,19 +389,19 @@ func (d *embedDecoder) close() {
 // embedSession is a KV-reuse chat session for embedding-input models (gemma
 // 3n/4). Each turn batch-ingests its new tokens into the shared KV cache via a
 // prefill-at-offset — the same prefill graph a fresh Generate uses, so the
-// cached i8 KV matches — then decodes the reply one token at a time. It
-// satisfies Conversation; NewConversation returns it for embedding-input models.
+// cached i8 KV matches — then decodes the reply one token at a time. The
+// embedder stages are the Engine's (compiled once); the session owns only its KV
+// cache and decode buffers. It satisfies Conversation; NewConversation returns
+// it for embedding-input models.
 type embedSession struct {
-	e        *Engine
-	o        GenOptions
-	tpl      litertlm.PromptTemplates
-	stop     map[int32]bool
-	opts     litert.Options
-	emb, ple *embedModel
-	kv       map[string]litert.TensorBuffer
-	dec      *embedDecoder
-	pos      int
-	started  bool
+	e       *Engine
+	o       GenOptions
+	tpl     litertlm.PromptTemplates
+	stop    map[int32]bool
+	kv      map[string]litert.TensorBuffer
+	dec     *embedDecoder
+	pos     int
+	started bool
 }
 
 func (e *Engine) newEmbedSession(o GenOptions) (*embedSession, error) {
@@ -437,11 +409,11 @@ func (e *Engine) newEmbedSession(o GenOptions) (*embedSession, error) {
 	if !ok {
 		return nil, fmt.Errorf("lm: model has no chat template (model type %q)", e.md.ModelType)
 	}
-	opts, err := litert.NewOptions(e.accel)
+	emb, ple, err := e.ensureEmbedders()
 	if err != nil {
 		return nil, err
 	}
-	s := &embedSession{e: e, o: o, tpl: tpl, stop: stopSet(e.tok, e.md), opts: opts}
+	s := &embedSession{e: e, o: o, tpl: tpl, stop: stopSet(e.tok, e.md)}
 	done := false
 	defer func() {
 		if !done {
@@ -449,49 +421,24 @@ func (e *Engine) newEmbedSession(o GenOptions) (*embedSession, error) {
 		}
 	}()
 
-	embSec, err := litertlm.SectionTFLiteModelType(e.fileBytes, litertlm.TFLiteEmbedder)
-	if err != nil {
-		return nil, fmt.Errorf("embedder section: %w", err)
-	}
-	if s.emb, err = newEmbedModel(e.env, opts, embSec); err != nil {
-		return nil, fmt.Errorf("embedder: %w", err)
-	}
-	if sigHasInput(e.decode, "per_layer_embeddings") {
-		pleSec, err := litertlm.SectionTFLiteModelType(e.fileBytes, litertlm.TFLitePerLayerEmbedder)
-		if err != nil {
-			return nil, fmt.Errorf("per-layer embedder section: %w", err)
-		}
-		if s.ple, err = newEmbedModel(e.env, opts, pleSec); err != nil {
-			return nil, fmt.Errorf("per-layer embedder: %w", err)
-		}
-	}
-
 	if s.kv, err = allocKV(e.env, e.cm, e.pre.max()); err != nil {
 		return nil, err
 	}
-	if s.dec, err = newEmbedDecoder(e.env, e.cm, e.decode, s.kv, s.emb, s.ple, newSampler(o.Temp, o.TopK, o.TopP, o.Seed)); err != nil {
+	if s.dec, err = newEmbedDecoder(e.env, e.cm, e.decode, s.kv, emb, ple, newSampler(o.Temp, o.TopK, o.TopP, o.Seed)); err != nil {
 		return nil, err
 	}
 	done = true
 	return s, nil
 }
 
-// Close releases the embedder stages, KV cache, and decode buffers.
+// Close releases the session's KV cache and decode buffers. The embedder stages
+// belong to the Engine and outlive the session.
 func (s *embedSession) Close() {
 	if s.dec != nil {
 		s.dec.close()
 	}
 	for _, b := range s.kv {
 		b.Close()
-	}
-	if s.ple != nil {
-		s.ple.close()
-	}
-	if s.emb != nil {
-		s.emb.close()
-	}
-	if s.opts != 0 {
-		s.opts.Close()
 	}
 }
 
@@ -525,7 +472,7 @@ func (s *embedSession) send(userText string, onPiece func(string)) (string, erro
 	// graph then feeds the held-back token, whose logits start the reply.
 	p := len(ids) - 1
 	if p > 0 {
-		if err := prefillEmbedRun(s.e.env, s.e.cm, s.e.pre, s.kv, s.emb, s.ple, ids[:p], s.pos); err != nil {
+		if err := prefillEmbedRun(s.e.env, s.e.cm, s.e.pre, s.kv, s.e.emb, s.e.ple, ids[:p], s.pos); err != nil {
 			return "", fmt.Errorf("prefill: %w", err)
 		}
 	}
