@@ -19,12 +19,47 @@ import (
 	"unsafe"
 
 	sentencepiece "github.com/eliben/go-sentencepiece"
+	"github.com/vladimirvivien/litert-go/hftok"
 	"github.com/vladimirvivien/litert-go/litert"
 	"github.com/vladimirvivien/litert-go/litertlm"
 )
 
 // maskNeg is the "masked" attention value LiteRT-LM uses for f32 (-0.7 * FLT_MAX).
 const maskNeg = float32(-0.7 * math.MaxFloat32)
+
+// tokenizer abstracts the model's tokenizer: SentencePiece or HF byte-level BPE.
+// BOS/EOS return -1 when the tokenizer does not define them (the metadata
+// start_token / stop_tokens take precedence).
+type tokenizer interface {
+	Encode(text string) []int32
+	Decode(ids []int) string
+	BOS() int32
+	EOS() int32
+}
+
+// spTokenizer adapts a SentencePiece processor to the tokenizer interface.
+type spTokenizer struct{ p *sentencepiece.Processor }
+
+func (s spTokenizer) Encode(text string) []int32 {
+	toks := s.p.Encode(text)
+	ids := make([]int32, len(toks))
+	for i, t := range toks {
+		ids[i] = int32(t.ID)
+	}
+	return ids
+}
+func (s spTokenizer) Decode(ids []int) string { return s.p.Decode(ids) }
+func (s spTokenizer) BOS() int32              { return int32(s.p.ModelInfo().BeginningOfSentenceID) }
+func (s spTokenizer) EOS() int32              { return int32(s.p.ModelInfo().EndOfSentenceID) }
+
+// hfTokenizer adapts an HF byte-level BPE tokenizer. It defines no BOS/EOS; the
+// metadata start_token / stop_tokens drive those.
+type hfTokenizer struct{ t *hftok.Tokenizer }
+
+func (h hfTokenizer) Encode(text string) []int32 { return h.t.Encode(text) }
+func (h hfTokenizer) Decode(ids []int) string    { return h.t.Decode(ids) }
+func (h hfTokenizer) BOS() int32                 { return -1 }
+func (h hfTokenizer) EOS() int32                 { return -1 }
 
 // Engine is a loaded, compiled model ready to generate text. It is not safe for
 // concurrent use.
@@ -33,7 +68,7 @@ type Engine struct {
 	model      litert.Model
 	cm         litert.CompiledModel
 	opts       litert.Options
-	tok        *sentencepiece.Processor
+	tok        tokenizer
 	md         litertlm.Metadata
 	fileBytes  []byte
 	pre        prefiller
@@ -76,9 +111,17 @@ func Open(libDir, modelPath string, accel litert.HwAccelerator) (*Engine, error)
 		}
 		e.md, _ = litertlm.ReadMetadata(e.fileBytes)
 		if sp, serr := litertlm.SectionBytes(e.fileBytes, litertlm.SectionSPTokenizer); serr == nil {
-			if e.tok, err = sentencepiece.NewProcessor(bytes.NewReader(sp)); err != nil {
-				return nil, fmt.Errorf("load tokenizer: %w", err)
+			p, perr := sentencepiece.NewProcessor(bytes.NewReader(sp))
+			if perr != nil {
+				return nil, fmt.Errorf("load tokenizer: %w", perr)
 			}
+			e.tok = spTokenizer{p}
+		} else if hf, herr := litertlm.SectionBytes(e.fileBytes, litertlm.SectionHFTokenizerZlib); herr == nil {
+			h, herr := hftok.LoadSection(hf)
+			if herr != nil {
+				return nil, fmt.Errorf("load HF tokenizer: %w", herr)
+			}
+			e.tok = hfTokenizer{h}
 		}
 	}
 	if e.model, err = litert.OpenModelFromBuffer(env, tflite); err != nil {
@@ -452,9 +495,7 @@ func (s *Session) send(userText string, onPiece func(string)) (string, error) {
 	} else {
 		render = s.tpl.Model.Suffix + render
 	}
-	for _, t := range s.e.tok.Encode(render) {
-		ids = append(ids, int32(t.ID))
-	}
+	ids = append(ids, s.e.tok.Encode(render)...)
 	if len(ids) == 0 {
 		return "", fmt.Errorf("empty turn")
 	}
@@ -538,6 +579,15 @@ func loadSig(m litert.Model, idx int) (sig, error) {
 
 func isKV(name string) bool { return strings.HasPrefix(name, "kv_cache_") }
 
+// tokenInput returns the name of a token-input signature's token IDs tensor;
+// models vary between "tokens" and "token_ids".
+func tokenInput(g sig) string {
+	if sigHasInput(g, "tokens") {
+		return "tokens"
+	}
+	return "token_ids"
+}
+
 // sigHasInput reports whether the signature has an input tensor of the given name.
 func sigHasInput(g sig, name string) bool {
 	_, ok := g.inByName[name]
@@ -619,12 +669,12 @@ func (p prefiller) plan(n int) []prefillChunk {
 // bucketSize reads a prefill signature's sequence-length bucket from its token
 // or embedding input shape ([1, bucket] or [1, bucket, H]).
 func bucketSize(g sig) (int, error) {
-	for _, name := range []string{"tokens", "embeddings"} {
+	for _, name := range []string{"tokens", "token_ids", "embeddings"} {
 		if sh, err := inputShape(g, name); err == nil && len(sh) >= 2 {
 			return int(sh[1]), nil
 		}
 	}
-	return 0, fmt.Errorf("prefill signature has no tokens/embeddings input")
+	return 0, fmt.Errorf("prefill signature has no tokens/token_ids/embeddings input")
 }
 
 // allocKV allocates a zeroed buffer for every KV-cache input of g, keyed by
@@ -670,14 +720,11 @@ type turn struct {
 
 // buildPrompt tokenizes text: as a raw completion (start token + text) or, with
 // chat set, wrapped in the model's chat template.
-func buildPrompt(tok *sentencepiece.Processor, md litertlm.Metadata, text string, chat bool) ([]int32, error) {
+func buildPrompt(tok tokenizer, md litertlm.Metadata, text string, chat bool) ([]int32, error) {
 	if chat {
 		return buildChatPrompt(tok, md, text)
 	}
-	ids := startIDs(tok, md)
-	for _, t := range tok.Encode(text) {
-		ids = append(ids, int32(t.ID))
-	}
+	ids := append(startIDs(tok, md), tok.Encode(text)...)
 	if len(ids) == 0 {
 		return nil, fmt.Errorf("empty tokenization of %q", text)
 	}
@@ -688,16 +735,13 @@ func buildPrompt(tok *sentencepiece.Processor, md litertlm.Metadata, text string
 // user.prefix ++ userText ++ user.suffix ++ model.prefix. The turn markers in
 // the affixes (e.g. <start_of_turn>) are user-defined tokenizer pieces, so
 // encoding the rendered string yields their single vocab IDs.
-func buildChatPrompt(tok *sentencepiece.Processor, md litertlm.Metadata, userText string) ([]int32, error) {
+func buildChatPrompt(tok tokenizer, md litertlm.Metadata, userText string) ([]int32, error) {
 	tpl, ok := md.Templates()
 	if !ok {
 		return nil, fmt.Errorf("no chat template for model type %q", md.ModelType)
 	}
-	ids := startIDs(tok, md)
 	rendered := tpl.User.Prefix + userText + tpl.User.Suffix + tpl.Model.Prefix
-	for _, t := range tok.Encode(rendered) {
-		ids = append(ids, int32(t.ID))
-	}
+	ids := append(startIDs(tok, md), tok.Encode(rendered)...)
 	if len(ids) < 2 {
 		return nil, fmt.Errorf("empty chat tokenization of %q", userText)
 	}
@@ -708,7 +752,7 @@ func buildChatPrompt(tok *sentencepiece.Processor, md litertlm.Metadata, userTex
 // token, then each turn wrapped in its role affixes, then the model prefix to
 // open the assistant's reply. The whole conversation is encoded as one string
 // so control-token boundaries tokenize correctly.
-func buildConversation(tok *sentencepiece.Processor, md litertlm.Metadata, tpl litertlm.PromptTemplates, hist []turn) []int32 {
+func buildConversation(tok tokenizer, md litertlm.Metadata, tpl litertlm.PromptTemplates, hist []turn) []int32 {
 	affix := func(role string) litertlm.Affixes {
 		switch role {
 		case "model":
@@ -728,25 +772,21 @@ func buildConversation(tok *sentencepiece.Processor, md litertlm.Metadata, tpl l
 	}
 	sb.WriteString(tpl.Model.Prefix)
 
-	ids := startIDs(tok, md)
-	for _, t := range tok.Encode(sb.String()) {
-		ids = append(ids, int32(t.ID))
-	}
-	return ids
+	return append(startIDs(tok, md), tok.Encode(sb.String())...)
 }
 
 // startIDs returns the start token IDs to prepend: the metadata start_token when
 // given as IDs, none for the "None" sentinel, otherwise the tokenizer's BOS when
 // it has one.
-func startIDs(tok *sentencepiece.Processor, md litertlm.Metadata) []int32 {
+func startIDs(tok tokenizer, md litertlm.Metadata) []int32 {
 	if len(md.StartToken.IDs) > 0 {
 		return append([]int32(nil), md.StartToken.IDs...)
 	}
 	if md.StartToken.Str == "None" {
 		return nil
 	}
-	if bos := tok.ModelInfo().BeginningOfSentenceID; bos >= 0 {
-		return []int32{int32(bos)}
+	if bos := tok.BOS(); bos >= 0 {
+		return []int32{bos}
 	}
 	return nil
 }
@@ -754,7 +794,7 @@ func startIDs(tok *sentencepiece.Processor, md litertlm.Metadata) []int32 {
 // stopSet collects the token IDs that end generation: the metadata stop_tokens
 // (IDs directly, single-token strings resolved through the tokenizer) plus the
 // tokenizer's end-of-sentence token. Multi-token stop strings are skipped.
-func stopSet(tok *sentencepiece.Processor, md litertlm.Metadata) map[int32]bool {
+func stopSet(tok tokenizer, md litertlm.Metadata) map[int32]bool {
 	set := map[int32]bool{}
 	if tok == nil {
 		return set
@@ -765,12 +805,12 @@ func stopSet(tok *sentencepiece.Processor, md litertlm.Metadata) map[int32]bool 
 		}
 		if st.Str != "" {
 			if enc := tok.Encode(st.Str); len(enc) == 1 {
-				set[int32(enc[0].ID)] = true
+				set[enc[0]] = true
 			}
 		}
 	}
-	if eos := tok.ModelInfo().EndOfSentenceID; eos >= 0 {
-		set[int32(eos)] = true
+	if eos := tok.EOS(); eos >= 0 {
+		set[eos] = true
 	}
 	return set
 }
@@ -829,7 +869,7 @@ func decodeTokenInput(env litert.Environment, cm litert.CompiledModel, pre prefi
 // visible. Bucket slots past len(ids) hold padding whose KV is later overwritten
 // or never attended.
 func prefillStep(env litert.Environment, cm litert.CompiledModel, g sig, kv map[string]litert.TensorBuffer, ids []int32, start int) error {
-	tokens, err := allocReqInput(env, cm, g, "tokens")
+	tokens, err := allocReqInput(env, cm, g, tokenInput(g))
 	if err != nil {
 		return err
 	}
@@ -861,7 +901,7 @@ func prefillStep(env litert.Environment, cm litert.CompiledModel, g sig, kv map[
 		return err
 	}
 
-	perCall := map[string]litert.TensorBuffer{"tokens": tokens, "input_pos": pos, "mask": mask}
+	perCall := map[string]litert.TensorBuffer{tokenInput(g): tokens, "input_pos": pos, "mask": mask}
 	in := assemble(g.inNames, perCall, kv)
 	out := assemble(g.outNames, nil, kv) // prefill outputs are all KV
 	for i, b := range in {
@@ -895,7 +935,7 @@ type decoder struct {
 func newDecoder(env litert.Environment, cm litert.CompiledModel, g sig, kv map[string]litert.TensorBuffer, smp *sampler) (*decoder, error) {
 	d := &decoder{smp: smp}
 	var err error
-	if d.tokens, err = allocReqInput(env, cm, g, "tokens"); err != nil {
+	if d.tokens, err = allocReqInput(env, cm, g, tokenInput(g)); err != nil {
 		return nil, err
 	}
 	if d.posBuf, err = allocReqInput(env, cm, g, "input_pos"); err != nil {
@@ -919,7 +959,7 @@ func newDecoder(env litert.Environment, cm litert.CompiledModel, g sig, kv map[s
 		d.vocab *= int(dim)
 	}
 
-	perCall := map[string]litert.TensorBuffer{"tokens": d.tokens, "input_pos": d.posBuf, "mask": d.mask}
+	perCall := map[string]litert.TensorBuffer{tokenInput(g): d.tokens, "input_pos": d.posBuf, "mask": d.mask}
 	in := assemble(g.inNames, perCall, kv)
 	out := assemble(g.outNames, map[string]litert.TensorBuffer{"logits": d.logits}, kv)
 	for i, b := range in {

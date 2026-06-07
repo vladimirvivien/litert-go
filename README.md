@@ -5,9 +5,10 @@ decode runtime (bucketed prefill, fixed-context KV cache, greedy decode) built o
 top. Prompts longer than a single prefill bucket are chunked across buckets at
 increasing positions, up to the model's KV-cache context length.
 
-`cmd/decode` runs the full pipeline on CPU: text → SentencePiece tokenizer
-(pure-Go `eliben/go-sentencepiece`, loaded from the `.litertlm`'s embedded
-tokenizer section) → prefill → greedy decode → detokenize → text.
+`cmd/decode` runs the full pipeline on CPU: text → tokenizer (pure-Go, loaded
+from the `.litertlm`'s embedded tokenizer section) → prefill → greedy decode →
+detokenize → text. Both tokenizer families are supported: SentencePiece (via
+`eliben/go-sentencepiece`) and HuggingFace byte-level BPE (`hftok`, e.g. Qwen).
 
 ```
 decode -lib <libLiteRt dir> -model gemma3-1b-it-int4.litertlm -text "The capital of France is"
@@ -70,12 +71,14 @@ litertlm/      .litertlm container reader (minimal FlatBuffer parser)
   litertlm.go    Sections (+ model_type hints) / SectionTFLite (selects the
                  prefill/decode graph) / SectionBytes
   metadata.go    ReadMetadata — model family + max tokens (protobuf scan)
+hftok/         pure-Go HuggingFace byte-level BPE tokenizer (Qwen, GPT-2 family)
 lm/            LLM runtime: Engine.Open / Generate / NewChat
-  engine.go      Engine, chat templating, token-input decode, sampling glue
+  engine.go      Engine, tokenizer abstraction, chat templating, token-input decode
   embed.go       embedding-input pipeline (gemma 3n/4: dual embedders, i8 KV)
   spec.go        MTP speculative decoding (drafter + verify)
   sample.go      temperature / top-k / top-p sampling
 cmd/decode/    thin CLI over lm (-text / -prompt / -repl, -chat, -spec, sampling)
+cmd/siginfo/   dump a model's sections and signature prefill shapes
 cmd/spike/     signature dump, compile, and smoke-run a single signature
 cmd/repro/     ffi argument-pinning regression guard
 ```

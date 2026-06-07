@@ -461,9 +461,7 @@ func (s *embedSession) send(userText string, onPiece func(string)) (string, erro
 	} else {
 		render = s.tpl.Model.Suffix + render
 	}
-	for _, t := range s.e.tok.Encode(render) {
-		ids = append(ids, int32(t.ID))
-	}
+	ids = append(ids, s.e.tok.Encode(render)...)
 	if len(ids) == 0 {
 		return "", fmt.Errorf("empty turn")
 	}

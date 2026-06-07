@@ -3,6 +3,7 @@ module github.com/vladimirvivien/litert-go
 go 1.26.2
 
 require (
+	github.com/dlclark/regexp2 v1.12.0
 	github.com/eliben/go-sentencepiece v0.7.0
 	github.com/jupiterrider/ffi v0.6.0
 )
