@@ -27,6 +27,31 @@ produces `logits f32[1,1,vocab]`, and no resize or KV-cache growth occurs.
 
 **Module:** `github.com/vladimirvivien/litert-go` · **Go:** 1.26.2
 
+## Library
+
+```go
+import (
+	"github.com/vladimirvivien/litert-go/litert"
+	"github.com/vladimirvivien/litert-go/lm"
+)
+
+eng, err := lm.Open(libDir, "gemma3-1b-it-int4.litertlm", litert.AccelCPU)
+defer eng.Close()
+
+out, _ := eng.Generate("What is the capital of France?", true /* chat */, lm.GenOptions{MaxTokens: 32})
+
+// Streaming (Generate/Send have token-by-token variants):
+_, _ = eng.GenerateStream("…", true, lm.GenOptions{MaxTokens: 64}, func(piece string) { fmt.Print(piece) })
+
+// Multi-turn, with sampling:
+chat, _ := eng.NewChat(lm.GenOptions{MaxTokens: 64, Temp: 0.8, TopK: 40})
+reply, _ := chat.Send("My name is Vlad.")
+reply, _ = chat.SendStream("What is my name?", func(piece string) { fmt.Print(piece) })
+```
+
+`GenOptions.Spec` enables MTP speculative decoding when the model supports it
+(`eng.SupportsSpec()`). The `cmd/decode` command is a thin CLI over this package.
+
 ## Layout
 
 ```
@@ -40,11 +65,12 @@ litertlm/      .litertlm container reader (minimal FlatBuffer parser)
   litertlm.go    Sections (+ model_type hints) / SectionTFLite (selects the
                  prefill/decode graph) / SectionBytes
   metadata.go    ReadMetadata — model family + max tokens (protobuf scan)
-cmd/decode/    text → prefill → greedy decode → text
-  main.go        token-input pipeline (gemma3, qwen3, …) + chat templating
-  gemma4.go      embedding-input pipeline (gemma 3n/4: dual embedders, i8 KV)
-  spec.go        MTP speculative decoding (drafter + verify; -spec)
+lm/            LLM runtime: Engine.Open / Generate / NewChat
+  engine.go      Engine, chat templating, token-input decode, sampling glue
+  embed.go       embedding-input pipeline (gemma 3n/4: dual embedders, i8 KV)
+  spec.go        MTP speculative decoding (drafter + verify)
   sample.go      temperature / top-k / top-p sampling
+cmd/decode/    thin CLI over lm (-text / -prompt / -repl, -chat, -spec, sampling)
 cmd/spike/     signature dump, compile, and smoke-run a single signature
 cmd/repro/     ffi argument-pinning regression guard
 ```

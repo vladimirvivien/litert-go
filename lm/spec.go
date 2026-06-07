@@ -1,4 +1,4 @@
-package main
+package lm
 
 import (
 	"fmt"
@@ -217,7 +217,7 @@ func elemCount(g sig, name string, out bool) int {
 
 // decodeSpeculative runs MTP speculative decoding on an embedding-input model
 // that has a verify signature and an mtp_drafter section.
-func decodeSpeculative(env litert.Environment, cm litert.CompiledModel, fileBytes []byte, prefill, decode, verifySig sig, prompt []int32, ngen int, stop map[int32]bool, accel litert.HwAccelerator) ([]int, error) {
+func decodeSpeculative(env litert.Environment, cm litert.CompiledModel, fileBytes []byte, prefill, decode, verifySig sig, prompt []int32, ngen int, stop map[int32]bool, accel litert.HwAccelerator, onToken func(int32)) ([]int, error) {
 	opts, err := litert.NewOptions(accel)
 	if err != nil {
 		return nil, err
@@ -310,6 +310,9 @@ func decodeSpeculative(env litert.Environment, cm litert.CompiledModel, fileByte
 			break
 		}
 		gen = append(gen, int(tokenID))
+		if onToken != nil {
+			onToken(tokenID)
+		}
 		if len(gen) >= ngen {
 			break
 		}
@@ -356,6 +359,9 @@ func decodeSpeculative(env litert.Environment, cm litert.CompiledModel, fileByte
 				break
 			}
 			gen = append(gen, int(drafts[i]))
+			if onToken != nil {
+				onToken(drafts[i])
+			}
 			if len(gen) >= ngen {
 				done = true
 				break
@@ -368,6 +374,9 @@ func decodeSpeculative(env litert.Environment, cm litert.CompiledModel, fileByte
 			break
 		}
 		gen = append(gen, int(bonus))
+		if onToken != nil {
+			onToken(bonus)
+		}
 
 		pos = pos + nc + 2
 		pending = bonus

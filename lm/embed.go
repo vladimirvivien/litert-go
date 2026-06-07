@@ -1,4 +1,4 @@
-package main
+package lm
 
 import (
 	"fmt"
@@ -98,7 +98,7 @@ func (e *embedModel) close() {
 // decodeEmbeddingInput runs the gemma 3n/4 pipeline: compile the embedder
 // stage(s) from the container, allocate the i8 KV cache, prefill all but the
 // last prompt token, then greedily decode from the held-back token.
-func decodeEmbeddingInput(env litert.Environment, cm litert.CompiledModel, fileBytes []byte, prefill, decode sig, prompt []int32, ngen int, stop map[int32]bool, accel litert.HwAccelerator, smp *sampler) ([]int, error) {
+func decodeEmbeddingInput(env litert.Environment, cm litert.CompiledModel, fileBytes []byte, prefill, decode sig, prompt []int32, ngen int, stop map[int32]bool, accel litert.HwAccelerator, smp *sampler, onToken func(int32)) ([]int, error) {
 	opts, err := litert.NewOptions(accel)
 	if err != nil {
 		return nil, err
@@ -167,6 +167,9 @@ func decodeEmbeddingInput(env litert.Environment, cm litert.CompiledModel, fileB
 			break
 		}
 		gen = append(gen, int(id))
+		if onToken != nil {
+			onToken(id)
+		}
 		next = id
 		pos++
 	}
