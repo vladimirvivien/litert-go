@@ -37,7 +37,8 @@ litert/        no-CGO binding to the LiteRT C API (purego + jupiterrider/ffi)
                  CompiledModel, TensorBuffer
   run.go         Runner — repeated Run over a fixed buffer set, arguments pinned once
 litertlm/      .litertlm container reader (minimal FlatBuffer parser)
-  litertlm.go    Sections / SectionTFLite / SectionBytes — extract sections
+  litertlm.go    Sections (+ model_type hints) / SectionTFLite (selects the
+                 prefill/decode graph) / SectionBytes
   metadata.go    ReadMetadata — model family + max tokens (protobuf scan)
 cmd/decode/    text → prefill → greedy decode → text
 cmd/spike/     signature dump, compile, and smoke-run a single signature
@@ -101,8 +102,11 @@ spike -lib ... -model ... -backend cpu -smoke -sig decode
 - CPU only. `-backend gpu` selects LiteRT's default GPU backend; forcing the
   OpenCL backend needs opaque GPU options that are not bound.
 - Greedy decode only — no temperature/top-k/top-p sampling or speculative decoding.
-- Multi-section containers (Gemma 3n/4, MTP, adapters) use the first `TFLiteModel`
-  section.
+- Token-ID-input models only. Multi-section containers select the
+  `tf_lite_prefill_decode` section automatically (other sections — embedder, MTP
+  drafter, vision/audio adapters — are identified by their `model_type` hint),
+  but models whose main graph consumes embeddings (Gemma 3n/4: a separate
+  `tf_lite_embedder` stage and i8 KV cache) are not yet wired.
 
 ## Build
 

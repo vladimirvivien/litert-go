@@ -11,14 +11,18 @@
 //	[32:end] FlatBuffer LiteRTLMMetaData (root_type)
 //
 // The metadata's section_metadata.objects[] each carry begin_offset/end_offset
-// (absolute file offsets) and a data_type. The TFLite model is the section whose
-// data_type is TFLiteModel.
+// (absolute file offsets), a data_type, and optional items (key/value hints). A
+// container may hold several TFLiteModel sections (Gemma 3n/4, MTP drafter,
+// adapters); each is tagged by an items "model_type" hint
+// (tf_lite_prefill_decode, tf_lite_embedder, tf_lite_mtp_drafter, …). The main
+// generation graph is the tf_lite_prefill_decode section.
 package litertlm
 
 import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"strings"
 )
 
 // AnySectionDataType values, in declaration order from the schema enum.
@@ -35,10 +39,26 @@ const (
 
 const magic = "LITERTLM"
 
+// HintModelType is the SectionObject items key whose value tags a TFLiteModel
+// section's role within a multi-section container.
+const HintModelType = "model_type"
+
+// model_type hint values (SectionObject items["model_type"]).
+const (
+	TFLitePrefillDecode = "tf_lite_prefill_decode" // the main generation graph
+	TFLiteEmbedder      = "tf_lite_embedder"
+	TFLiteMTPDrafter    = "tf_lite_mtp_drafter"
+)
+
+// vDataStringValue is the VData union tag for StringValue (schema enum order,
+// NONE=0). Section item parsing reads only string-valued hints.
+const vDataStringValue = 9
+
 // Section locates one object within a .litertlm container.
 type Section struct {
 	Type       uint8
 	Begin, End uint64
+	Items      map[string]string // string-valued SectionObject items (hints)
 }
 
 // TypeName returns a short name for the section's data type.
@@ -76,10 +96,47 @@ func ReadTFLite(path string) ([]byte, error) {
 	return SectionTFLite(data)
 }
 
-// SectionTFLite returns the first TFLiteModel section from an in-memory
-// .litertlm container.
+// SectionTFLite returns the main generation graph: the TFLiteModel section
+// tagged model_type=tf_lite_prefill_decode, or — for single-section or unhinted
+// containers — the first TFLiteModel section with no model_type hint. Sections
+// hinted as other roles (embedder, MTP drafter, adapters) are skipped.
 func SectionTFLite(file []byte) ([]byte, error) {
-	return SectionBytes(file, SectionTFLiteModel)
+	sections, err := Sections(file)
+	if err != nil {
+		return nil, err
+	}
+	for _, s := range sections {
+		if s.Type != SectionTFLiteModel {
+			continue
+		}
+		if mt := s.Items[HintModelType]; mt == "" || strings.EqualFold(mt, TFLitePrefillDecode) {
+			return sectionData(file, s)
+		}
+	}
+	return nil, fmt.Errorf("litertlm: no prefill/decode TFLiteModel section")
+}
+
+// SectionTFLiteModelType returns the TFLiteModel section whose model_type hint
+// matches modelType (case-insensitive) — e.g. TFLiteMTPDrafter for the
+// speculative-decoding draft model.
+func SectionTFLiteModelType(file []byte, modelType string) ([]byte, error) {
+	sections, err := Sections(file)
+	if err != nil {
+		return nil, err
+	}
+	for _, s := range sections {
+		if s.Type == SectionTFLiteModel && strings.EqualFold(s.Items[HintModelType], modelType) {
+			return sectionData(file, s)
+		}
+	}
+	return nil, fmt.Errorf("litertlm: no TFLiteModel section with model_type %q", modelType)
+}
+
+func sectionData(file []byte, s Section) ([]byte, error) {
+	if s.End > uint64(len(file)) || s.Begin > s.End {
+		return nil, fmt.Errorf("litertlm: bad section range [%d,%d)", s.Begin, s.End)
+	}
+	return file[s.Begin:s.End], nil
 }
 
 // Sections parses the container header and returns its section table.
@@ -116,7 +173,8 @@ func Sections(file []byte) ([]Section, error) {
 	sections := make([]Section, 0, n)
 	for i := uint32(0); i < n; i++ {
 		obj := meta.indirect(objs + 4 + 4*i)
-		// SectionObject: begin_offset=field 1, end_offset=field 2, data_type=field 3.
+		// SectionObject: items=field 0, begin_offset=field 1, end_offset=field 2,
+		// data_type=field 3.
 		var s Section
 		if off := meta.field(obj, 1); off != 0 {
 			s.Begin = meta.u64(off)
@@ -127,6 +185,7 @@ func Sections(file []byte) ([]Section, error) {
 		if off := meta.field(obj, 3); off != 0 {
 			s.Type = meta.b[off]
 		}
+		s.Items = meta.sectionItems(obj)
 		sections = append(sections, s)
 	}
 	return sections, nil
@@ -159,4 +218,53 @@ func (f fb) field(tablePos uint32, id int) uint32 {
 		return 0
 	}
 	return tablePos + rel
+}
+
+// str reads the string whose uoffset is stored at fieldOff (as returned by
+// field). A FlatBuffers string is a uoffset to a u32 length followed by bytes.
+func (f fb) str(fieldOff uint32) string {
+	pos := f.indirect(fieldOff)
+	if pos+4 > uint32(len(f.b)) {
+		return ""
+	}
+	n := f.u32(pos)
+	end := pos + 4 + n
+	if end > uint32(len(f.b)) {
+		return ""
+	}
+	return string(f.b[pos+4 : end])
+}
+
+// sectionItems reads SectionObject.items (field 0), a vector of KeyValuePair,
+// collecting only the string-valued entries into a map. KeyValuePair fields:
+// key=0 (string), value_type=1 (ubyte VData tag), value=2 (union table); the
+// StringValue member holds its string at field 0.
+func (f fb) sectionItems(obj uint32) map[string]string {
+	itemsField := f.field(obj, 0)
+	if itemsField == 0 {
+		return nil
+	}
+	vec := f.indirect(itemsField)
+	n := f.u32(vec)
+	items := make(map[string]string, n)
+	for i := uint32(0); i < n; i++ {
+		kvp := f.indirect(vec + 4 + 4*i)
+		keyField := f.field(kvp, 0)
+		vtField := f.field(kvp, 1)
+		valField := f.field(kvp, 2)
+		if keyField == 0 || vtField == 0 || valField == 0 {
+			continue
+		}
+		if f.b[vtField] != vDataStringValue {
+			continue
+		}
+		valTable := f.indirect(valField)
+		if sField := f.field(valTable, 0); sField != 0 {
+			items[f.str(keyField)] = f.str(sField)
+		}
+	}
+	if len(items) == 0 {
+		return nil
+	}
+	return items
 }

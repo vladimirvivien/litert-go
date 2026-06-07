@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"unsafe"
 
 	"github.com/vladimirvivien/litert-go/litert"
@@ -63,19 +64,25 @@ func run(libDir, modelPath, backend, sigName string, smoke bool) error {
 		}
 		fmt.Printf(".litertlm container, %d sections:\n", len(secs))
 		nTFLite := 0
+		marked := false
 		for _, s := range secs {
+			hint := ""
+			if mt := s.Items[litertlm.HintModelType]; mt != "" {
+				hint = "  model_type=" + mt
+			}
 			marker := ""
 			if s.Type == litertlm.SectionTFLiteModel {
-				if nTFLite == 0 {
-					marker = "  <- extracting"
-				}
 				nTFLite++
+				mt := s.Items[litertlm.HintModelType]
+				if !marked && (mt == "" || strings.EqualFold(mt, litertlm.TFLitePrefillDecode)) {
+					marker = "  <- main"
+					marked = true
+				}
 			}
-			fmt.Printf("  %-18s [%d, %d) %d bytes%s\n", s.TypeName(), s.Begin, s.End, s.End-s.Begin, marker)
+			fmt.Printf("  %-18s [%d, %d) %d bytes%s%s\n", s.TypeName(), s.Begin, s.End, s.End-s.Begin, hint, marker)
 		}
 		if nTFLite > 1 {
-			fmt.Printf("  NOTE: %d TFLiteModel sections; using the first. Multi-section models "+
-				"(Gemma 3n/4, MTP drafter, adapters) may need a specific one.\n", nTFLite)
+			fmt.Printf("  %d TFLiteModel sections; SectionTFLite selects model_type=%s.\n", nTFLite, litertlm.TFLitePrefillDecode)
 		}
 		if md, err := litertlm.ReadMetadata(raw); err == nil {
 			fmt.Printf("  model type: %s", md.ModelType)
