@@ -269,7 +269,7 @@ func decodeSpeculative(env litert.Environment, cm litert.CompiledModel, fileByte
 	}
 
 	p := len(prompt) - 1
-	if err := prefillEmbed(env, cm, prefill, kv, emb, ple, prompt[:p]); err != nil {
+	if err := prefillEmbed(env, cm, prefill, kv, emb, ple, prompt[:p], 0); err != nil {
 		return nil, fmt.Errorf("prefill: %w", err)
 	}
 

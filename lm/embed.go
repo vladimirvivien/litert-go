@@ -145,7 +145,7 @@ func decodeEmbeddingInput(env litert.Environment, cm litert.CompiledModel, fileB
 	}
 
 	p := len(prompt) - 1
-	if err := prefillEmbed(env, cm, prefill, kv, emb, ple, prompt[:p]); err != nil {
+	if err := prefillEmbed(env, cm, prefill, kv, emb, ple, prompt[:p], 0); err != nil {
 		return nil, fmt.Errorf("prefill: %w", err)
 	}
 
@@ -233,7 +233,12 @@ func closeBufs(bufs map[string]litert.TensorBuffer) {
 	}
 }
 
-func prefillEmbed(env litert.Environment, cm litert.CompiledModel, g sig, kv map[string]litert.TensorBuffer, emb, ple *embedModel, ids []int32) error {
+// prefillEmbed batch-ingests ids into the KV cache at position start: it embeds
+// the tokens, writes input_pos [start, start+len), a causal mask whose row i
+// attends [0, start+i+1) (so earlier cached turns stay visible), and a
+// param_tensor that begins the KV write at start. With start 0 it is a fresh
+// prefill; with start > 0 it appends a turn to an existing cache.
+func prefillEmbed(env litert.Environment, cm litert.CompiledModel, g sig, kv map[string]litert.TensorBuffer, emb, ple *embedModel, ids []int32, start int) error {
 	embShape, _ := inputShape(g, "embeddings") // [1, seq, H]
 	seq := int(embShape[1])
 	if len(ids) > seq {
@@ -254,12 +259,12 @@ func prefillEmbed(env litert.Environment, cm litert.CompiledModel, g sig, kv map
 	rows, ctx := int(maskShape[2]), int(maskShape[3])
 	pos := make([]int32, seq)
 	for i := range pos {
-		pos[i] = int32(i)
+		pos[i] = int32(start + i)
 	}
-	n := int32(len(ids))
+	n := len(ids)
 
 	for name, b := range bufs {
-		if err := fillEmbedInput(b, name, text, perLayer, pos, rows, ctx, int(n), 0); err != nil {
+		if err := fillEmbedInput(b, name, text, perLayer, pos, rows, ctx, n, start); err != nil {
 			return err
 		}
 	}
@@ -355,21 +360,32 @@ func newEmbedDecoder(env litert.Environment, cm litert.CompiledModel, g sig, kv 
 	return d, nil
 }
 
-func (d *embedDecoder) step(token int32, pos int) (int32, error) {
+// feed embeds one token, writes it into the KV cache at pos through the decode
+// graph, and leaves logits in d.out["logits"]. It does not sample.
+func (d *embedDecoder) feed(token int32, pos int) error {
 	text, perLayer, err := embedTokens(d.emb, d.ple, []int32{token})
 	if err != nil {
-		return 0, err
+		return err
 	}
 	d.pos[0] = int32(pos)
 	for name, b := range d.in {
 		if err := fillEmbedInput(b, name, text, perLayer, d.pos, 1, d.ctx, 1, pos); err != nil {
-			return 0, err
+			return err
 		}
 	}
-	if err := d.runner.Run(); err != nil {
+	return d.runner.Run()
+}
+
+// sample picks the next token from the logits of the most recent feed.
+func (d *embedDecoder) sample() (int32, error) {
+	return d.smp.sample(d.out["logits"], d.vocab)
+}
+
+func (d *embedDecoder) step(token int32, pos int) (int32, error) {
+	if err := d.feed(token, pos); err != nil {
 		return 0, err
 	}
-	return d.smp.sample(d.out["logits"], d.vocab)
+	return d.sample()
 }
 
 // stepAct is step plus the decode activations (the hidden state the MTP drafter
@@ -390,6 +406,163 @@ func (d *embedDecoder) close() {
 	d.runner.Close()
 	closeBufs(d.in)
 	closeBufs(d.out)
+}
+
+// embedSession is a KV-reuse chat session for embedding-input models (gemma
+// 3n/4). Each turn batch-ingests its new tokens into the shared KV cache via a
+// prefill-at-offset — the same prefill graph a fresh Generate uses, so the
+// cached i8 KV matches — then decodes the reply one token at a time. It
+// satisfies Conversation; NewConversation returns it for embedding-input models.
+type embedSession struct {
+	e        *Engine
+	o        GenOptions
+	tpl      litertlm.PromptTemplates
+	stop     map[int32]bool
+	opts     litert.Options
+	emb, ple *embedModel
+	kv       map[string]litert.TensorBuffer
+	dec      *embedDecoder
+	pos      int
+	started  bool
+}
+
+func (e *Engine) newEmbedSession(o GenOptions) (*embedSession, error) {
+	tpl, ok := e.md.Templates()
+	if !ok {
+		return nil, fmt.Errorf("lm: model has no chat template (model type %q)", e.md.ModelType)
+	}
+	opts, err := litert.NewOptions(e.accel)
+	if err != nil {
+		return nil, err
+	}
+	s := &embedSession{e: e, o: o, tpl: tpl, stop: stopSet(e.tok, e.md), opts: opts, kv: map[string]litert.TensorBuffer{}}
+	done := false
+	defer func() {
+		if !done {
+			s.Close()
+		}
+	}()
+
+	embSec, err := litertlm.SectionTFLiteModelType(e.fileBytes, litertlm.TFLiteEmbedder)
+	if err != nil {
+		return nil, fmt.Errorf("embedder section: %w", err)
+	}
+	if s.emb, err = newEmbedModel(e.env, opts, embSec); err != nil {
+		return nil, fmt.Errorf("embedder: %w", err)
+	}
+	if sigHasInput(e.decode, "per_layer_embeddings") {
+		pleSec, err := litertlm.SectionTFLiteModelType(e.fileBytes, litertlm.TFLitePerLayerEmbedder)
+		if err != nil {
+			return nil, fmt.Errorf("per-layer embedder section: %w", err)
+		}
+		if s.ple, err = newEmbedModel(e.env, opts, pleSec); err != nil {
+			return nil, fmt.Errorf("per-layer embedder: %w", err)
+		}
+	}
+
+	for _, name := range e.prefill.inNames {
+		if !isKV(name) {
+			continue
+		}
+		buf, err := allocReqInput(e.env, e.cm, e.prefill, name)
+		if err != nil {
+			return nil, fmt.Errorf("alloc %s: %w", name, err)
+		}
+		s.kv[name] = buf
+	}
+	if s.dec, err = newEmbedDecoder(e.env, e.cm, e.decode, s.kv, s.emb, s.ple, newSampler(o.Temp, o.TopK, o.TopP, o.Seed)); err != nil {
+		return nil, err
+	}
+	done = true
+	return s, nil
+}
+
+// Close releases the embedder stages, KV cache, and decode buffers.
+func (s *embedSession) Close() {
+	if s.dec != nil {
+		s.dec.close()
+	}
+	for _, b := range s.kv {
+		b.Close()
+	}
+	if s.ple != nil {
+		s.ple.close()
+	}
+	if s.emb != nil {
+		s.emb.close()
+	}
+	if s.opts != 0 {
+		s.opts.Close()
+	}
+}
+
+// Send adds a user message and returns the reply.
+func (s *embedSession) Send(userText string) (string, error) { return s.send(userText, nil) }
+
+// SendStream is Send with incremental output.
+func (s *embedSession) SendStream(userText string, onPiece func(string)) (string, error) {
+	return s.send(userText, onPiece)
+}
+
+func (s *embedSession) send(userText string, onPiece func(string)) (string, error) {
+	// Render the new turn. The first turn carries the start token; later turns
+	// first close the previous model turn with its suffix.
+	render := s.tpl.User.Prefix + userText + s.tpl.User.Suffix + s.tpl.Model.Prefix
+	var ids []int32
+	if !s.started {
+		ids = startIDs(s.e.tok, s.e.md)
+		s.started = true
+	} else {
+		render = s.tpl.Model.Suffix + render
+	}
+	for _, t := range s.e.tok.Encode(render) {
+		ids = append(ids, int32(t.ID))
+	}
+	if len(ids) == 0 {
+		return "", fmt.Errorf("empty turn")
+	}
+
+	// Batch-ingest all but the last turn token via prefill-at-offset; the decode
+	// graph then feeds the held-back token, whose logits start the reply.
+	p := len(ids) - 1
+	if p > 0 {
+		if err := prefillEmbed(s.e.env, s.e.cm, s.e.prefill, s.kv, s.emb, s.ple, ids[:p], s.pos); err != nil {
+			return "", fmt.Errorf("prefill: %w", err)
+		}
+	}
+	pos := s.pos + p
+	if err := s.dec.feed(ids[p], pos); err != nil {
+		return "", err
+	}
+	pos++
+	id, err := s.dec.sample()
+	if err != nil {
+		return "", err
+	}
+
+	var stream func(int32)
+	if onPiece != nil {
+		stream = s.e.streamer(onPiece)
+	}
+	var gen []int
+	for g := 0; g < s.o.MaxTokens; g++ {
+		if s.stop[id] {
+			break
+		}
+		gen = append(gen, int(id))
+		if stream != nil {
+			stream(id)
+		}
+		if err := s.dec.feed(id, pos); err != nil {
+			return "", err
+		}
+		pos++
+		if id, err = s.dec.sample(); err != nil {
+			return "", err
+		}
+	}
+	s.pos = pos
+	return s.e.tok.Decode(gen), nil
 }
 
 // readFloats copies the first n elements of an f32 buffer out to Go memory.

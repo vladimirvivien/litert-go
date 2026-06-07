@@ -300,19 +300,24 @@ type Conversation interface {
 	Close()
 }
 
-// NewConversation starts a multi-turn chat with the most efficient available
-// strategy: a KV-reuse Session for token-input models, a re-prefill Chat for
-// embedding-input models. Call Close on the result if it is a *Session.
+// NewConversation starts a multi-turn chat with a KV-reuse session: a Session
+// for token-input models, an embedSession (turns ingested via prefill-at-offset)
+// for embedding-input models. Models without a tokenizer or chat template fall
+// back to a re-prefill Chat. Always Close the result.
 func (e *Engine) NewConversation(o GenOptions) (Conversation, error) {
-	if e.tok != nil && e.HasChatTemplate() && !sigHasInput(e.decode, "embeddings") {
-		return e.NewSession(o)
+	if e.tok == nil || !e.HasChatTemplate() {
+		return e.NewChat(o)
 	}
-	return e.NewChat(o)
+	if sigHasInput(e.decode, "embeddings") {
+		return e.newEmbedSession(o)
+	}
+	return e.NewSession(o)
 }
 
 // Session is a multi-turn chat that keeps the KV cache across turns: each turn
 // ingests only its new tokens at the cached position instead of re-prefilling
-// the whole history. Token-input models only. Close releases the cache.
+// the whole history. Token-input models only; embedding-input models use the
+// equivalent embedSession via NewConversation. Close releases the cache.
 type Session struct {
 	e       *Engine
 	o       GenOptions
@@ -324,8 +329,10 @@ type Session struct {
 	started bool
 }
 
-// NewSession starts a KV-reuse chat session. It fails for embedding-input models
-// (use NewChat / NewConversation).
+// NewSession starts a KV-reuse chat session for a token-input model. It fails on
+// an embedding-input model: those ingest each turn with a batched
+// prefill-at-offset rather than a sequential decode (the i8 KV cache requires
+// it), handled by the embedSession that NewConversation returns.
 func (e *Engine) NewSession(o GenOptions) (*Session, error) {
 	if e.tok == nil {
 		return nil, fmt.Errorf("lm: model has no tokenizer")

@@ -43,8 +43,9 @@ out, _ := eng.Generate("What is the capital of France?", true /* chat */, lm.Gen
 // Streaming (Generate/Send have token-by-token variants):
 _, _ = eng.GenerateStream("…", true, lm.GenOptions{MaxTokens: 64}, func(piece string) { fmt.Print(piece) })
 
-// Multi-turn (NewConversation picks a KV-reuse Session for token-input models,
-// a re-prefill Chat for embedding-input models):
+// Multi-turn (NewConversation returns a KV-reuse session: token-input models
+// ingest each turn through the decode graph, embedding-input models through a
+// prefill-at-offset):
 conv, _ := eng.NewConversation(lm.GenOptions{MaxTokens: 64, Temp: 0.8, TopK: 40})
 defer conv.Close()
 reply, _ := conv.Send("My name is Vlad.")
@@ -164,12 +165,12 @@ spike -lib ... -model ... -backend cpu -smoke -sig decode
   on CPU, so the win needs a GPU backend (where it parallelizes).
 - Text only. Both token-input models (gemma3, qwen3, …) and embedding-input
   models (Gemma 3n/4, which run separate text + per-layer embedder stages into
-  the main graph) are supported. `-repl` is interactive multi-turn chat: token-input
-  models use a KV-reuse `Session` (each turn ingests only its new tokens), while
-  embedding-input models fall back to re-rendering and re-prefilling the history
-  each turn (bounded by the prefill bucket size). Multi-section containers select
-  sections by their `model_type` hint; the vision/audio adapter sections are
-  identified but not yet driven.
+  the main graph) are supported. `-repl` is interactive multi-turn chat over a
+  KV-reuse session that ingests only each turn's new tokens: token-input models
+  through the decode graph, embedding-input models through a prefill-at-offset
+  into the retained cache. Multi-section containers select sections by their
+  `model_type` hint; the vision/audio adapter sections are identified but not yet
+  driven.
 
 ## Build & test
 
@@ -179,12 +180,19 @@ go vet ./...
 go test ./...
 ```
 
-Unit tests run without hardware. The `lm` package also has an env-gated
-integration test against a real model (greedy determinism, stream ≡ non-stream,
-`Session` ≡ `Generate`, seeded sampling, multi-turn):
+Unit tests run without hardware. The `lm` package also has env-gated integration
+tests against real models. Token-input model (greedy determinism, stream ≡
+non-stream, `Session` ≡ `Generate`, seeded sampling, multi-turn):
 
 ```
 LITERT_LIB=/abs/lib LITERT_LM_MODEL=/abs/model.litertlm go test ./lm
+```
+
+Embedding-input model (Gemma 3n/4 — Session turn 1 ≡ `Generate`, multi-turn
+prefill-at-offset retains context):
+
+```
+LITERT_LIB=/abs/lib LITERT_LM_EMBED_MODEL=/abs/gemma-4.litertlm go test ./lm
 ```
 
 ## Benchmarks
