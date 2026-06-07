@@ -32,6 +32,14 @@ func main() {
 	}
 	tflite := raw
 	if litertlm.IsContainer(raw) {
+		secs, err := litertlm.Sections(raw)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Printf("%d sections:\n", len(secs))
+		for _, s := range secs {
+			fmt.Printf("  %-18s items=%v\n", s.TypeName(), s.Items)
+		}
 		if tflite, err = litertlm.SectionTFLite(raw); err != nil {
 			panic(err)
 		}
