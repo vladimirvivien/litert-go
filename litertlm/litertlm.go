@@ -45,9 +45,10 @@ const HintModelType = "model_type"
 
 // model_type hint values (SectionObject items["model_type"]).
 const (
-	TFLitePrefillDecode = "tf_lite_prefill_decode" // the main generation graph
-	TFLiteEmbedder      = "tf_lite_embedder"
-	TFLiteMTPDrafter    = "tf_lite_mtp_drafter"
+	TFLitePrefillDecode    = "tf_lite_prefill_decode" // the main generation graph
+	TFLiteEmbedder         = "tf_lite_embedder"
+	TFLitePerLayerEmbedder = "tf_lite_per_layer_embedder"
+	TFLiteMTPDrafter       = "tf_lite_mtp_drafter"
 )
 
 // vDataStringValue is the VData union tag for StringValue (schema enum order,

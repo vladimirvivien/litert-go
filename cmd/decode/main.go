@@ -37,6 +37,8 @@ func main() {
 	promptCSV := flag.String("prompt", "", "prompt token IDs, comma-separated (alternative to -text)")
 	ngen := flag.Int("n", 16, "max number of tokens to generate")
 	chat := flag.Bool("chat", false, "wrap -text in the model's chat template (from container metadata)")
+	backend := flag.String("backend", "cpu", "compile backend: cpu | gpu")
+	spec := flag.Bool("spec", false, "MTP speculative decoding (needs a verify signature + mtp_drafter section)")
 	flag.Parse()
 
 	if *modelPath == "" || (*text == "" && *promptCSV == "") {
@@ -44,9 +46,25 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
-	if err := run(*libDir, *modelPath, *text, *promptCSV, *ngen, *chat); err != nil {
+	accel, err := parseBackend(*backend)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "decode:", err)
+		os.Exit(2)
+	}
+	if err := run(*libDir, *modelPath, *text, *promptCSV, *ngen, *chat, accel, *spec); err != nil {
 		fmt.Fprintln(os.Stderr, "decode:", err)
 		os.Exit(1)
+	}
+}
+
+func parseBackend(s string) (litert.HwAccelerator, error) {
+	switch s {
+	case "cpu":
+		return litert.AccelCPU, nil
+	case "gpu":
+		return litert.AccelGPU, nil
+	default:
+		return 0, fmt.Errorf("unknown backend %q (cpu|gpu)", s)
 	}
 }
 
@@ -105,7 +123,7 @@ func loadSig(m litert.Model, idx int) (sig, error) {
 
 func isKV(name string) bool { return strings.HasPrefix(name, "kv_cache_") }
 
-func run(libDir, modelPath, text, promptCSV string, ngen int, chat bool) error {
+func run(libDir, modelPath, text, promptCSV string, ngen int, chat bool, accel litert.HwAccelerator, spec bool) error {
 	if err := litert.Load(libDir); err != nil {
 		return err
 	}
@@ -141,8 +159,8 @@ func run(libDir, modelPath, text, promptCSV string, ngen int, chat bool) error {
 	defer runtime.KeepAlive(fileBytes) // model holds C pointers into tflite (a slice of fileBytes)
 
 	nsig, _ := model.NumSignatures()
-	var prefill, decode sig
-	var havePrefill, haveDecode bool
+	var prefill, decode, verify sig
+	var havePrefill, haveDecode, haveVerify bool
 	for i := 0; i < nsig; i++ {
 		s, _ := model.Signature(i)
 		key, _ := s.Key()
@@ -152,6 +170,11 @@ func run(libDir, modelPath, text, promptCSV string, ngen int, chat bool) error {
 				return err
 			}
 			haveDecode = true
+		case key == "verify":
+			if verify, err = loadSig(model, i); err != nil {
+				return err
+			}
+			haveVerify = true
 		case strings.HasPrefix(key, "prefill") && !havePrefill:
 			if prefill, err = loadSig(model, i); err != nil {
 				return err
@@ -162,8 +185,11 @@ func run(libDir, modelPath, text, promptCSV string, ngen int, chat bool) error {
 	if !havePrefill || !haveDecode {
 		return fmt.Errorf("model lacks prefill/decode signatures")
 	}
+	if spec && !(haveVerify && sigHasInput(decode, "embeddings")) {
+		return fmt.Errorf("-spec needs a verify signature and an embedding-input model")
+	}
 
-	opts, err := litert.NewOptions(litert.AccelCPU)
+	opts, err := litert.NewOptions(accel)
 	if err != nil {
 		return err
 	}
@@ -174,8 +200,46 @@ func run(libDir, modelPath, text, promptCSV string, ngen int, chat bool) error {
 	}
 	defer cm.Close()
 
-	// KV cache: allocate once at the model's fixed (concrete) shapes, shared by
-	// both prefill and decode.
+	prompt, err := buildPrompt(tok, md, text, promptCSV, chat)
+	if err != nil {
+		return err
+	}
+	stop := stopSet(tok, md)
+
+	// Token-input models (gemma3, qwen3, …) feed token IDs directly. Models with
+	// an "embeddings" input (gemma 3n/4) run a separate embedder stage first;
+	// with -spec and an mtp_drafter section they use MTP speculative decoding.
+	var gen []int
+	switch {
+	case spec:
+		gen, err = decodeSpeculative(env, cm, fileBytes, prefill, decode, verify, prompt, ngen, stop, accel)
+	case sigHasInput(decode, "embeddings"):
+		gen, err = decodeEmbeddingInput(env, cm, fileBytes, prefill, decode, prompt, ngen, stop, accel)
+	default:
+		gen, err = decodeTokenInput(env, cm, prefill, decode, prompt, ngen, stop)
+	}
+	if err != nil {
+		return err
+	}
+
+	if tok != nil {
+		fmt.Printf("prompt: %q\noutput: %q\n", text, tok.Decode(gen))
+	} else {
+		fmt.Printf("prompt=%v\noutput tokens=%v\n", prompt, gen)
+	}
+	return nil
+}
+
+// sigHasInput reports whether the signature has an input tensor of the given name.
+func sigHasInput(g sig, name string) bool {
+	_, ok := g.inByName[name]
+	return ok
+}
+
+// decodeTokenInput runs the static token-input pipeline (gemma3, qwen3, …):
+// allocate the KV cache once, prefill all but the last prompt token, then
+// greedily decode from the held-back token.
+func decodeTokenInput(env litert.Environment, cm litert.CompiledModel, prefill, decode sig, prompt []int32, ngen int, stop map[int32]bool) ([]int, error) {
 	kv := map[string]litert.TensorBuffer{}
 	defer func() {
 		for _, b := range kv {
@@ -188,39 +252,29 @@ func run(libDir, modelPath, text, promptCSV string, ngen int, chat bool) error {
 		}
 		buf, err := allocReqInput(env, cm, prefill, name)
 		if err != nil {
-			return fmt.Errorf("alloc %s: %w", name, err)
+			return nil, fmt.Errorf("alloc %s: %w", name, err)
 		}
 		kv[name] = buf
 	}
 
-	prompt, err := buildPrompt(tok, md, text, promptCSV, chat)
-	if err != nil {
-		return err
-	}
-
-	// Prefill the first P tokens (hold back the last prompt token for decode).
 	p := len(prompt) - 1
 	if err := prefillStep(env, cm, prefill, kv, prompt[:p]); err != nil {
-		return fmt.Errorf("prefill: %w", err)
+		return nil, fmt.Errorf("prefill: %w", err)
 	}
 
-	// Greedy decode: first step consumes the held-back token at position P;
-	// stop at end-of-sentence. The decode buffer set is fixed, so allocate it
-	// once and reuse it — and its pinned Run arguments — across every step.
 	dec, err := newDecoder(env, cm, decode, kv)
 	if err != nil {
-		return fmt.Errorf("decode setup: %w", err)
+		return nil, fmt.Errorf("decode setup: %w", err)
 	}
 	defer dec.close()
 
-	stop := stopSet(tok, md)
 	next := prompt[p]
 	pos := p
 	var gen []int
 	for g := 0; g < ngen; g++ {
 		id, err := dec.step(next, pos)
 		if err != nil {
-			return fmt.Errorf("decode step %d: %w", g, err)
+			return nil, fmt.Errorf("decode step %d: %w", g, err)
 		}
 		if stop[id] {
 			break
@@ -229,13 +283,7 @@ func run(libDir, modelPath, text, promptCSV string, ngen int, chat bool) error {
 		next = id
 		pos++
 	}
-
-	if tok != nil {
-		fmt.Printf("prompt: %q\noutput: %q\n", text, tok.Decode(gen))
-	} else {
-		fmt.Printf("prompt=%v\noutput tokens=%v\n", prompt, gen)
-	}
-	return nil
+	return gen, nil
 }
 
 // buildPrompt produces prompt token IDs. With -prompt it parses raw IDs; with

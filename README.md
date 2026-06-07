@@ -41,6 +41,9 @@ litertlm/      .litertlm container reader (minimal FlatBuffer parser)
                  prefill/decode graph) / SectionBytes
   metadata.go    ReadMetadata — model family + max tokens (protobuf scan)
 cmd/decode/    text → prefill → greedy decode → text
+  main.go        token-input pipeline (gemma3, qwen3, …) + chat templating
+  gemma4.go      embedding-input pipeline (gemma 3n/4: dual embedders, i8 KV)
+  spec.go        MTP speculative decoding (drafter + verify; -spec)
 cmd/spike/     signature dump, compile, and smoke-run a single signature
 cmd/repro/     ffi argument-pinning regression guard
 ```
@@ -81,6 +84,16 @@ decode -lib /path/to/libLiteRt -model model.litertlm -chat -text "What is the ca
 Containers that carry only a Jinja template (e.g. Gemma 4) fall back to the
 documented fixed affixes for that family, keyed on `llm_model_type`.
 
+`-spec` enables MTP speculative decoding on models that carry a `verify`
+signature and a `tf_lite_mtp_drafter` section (Gemma 4): the drafter proposes K
+tokens, the base model verifies them in one pass, and the matching prefix is
+accepted. Output is identical to greedy. It prints an acceptance rate
+(tokens/verify-pass) to stderr.
+
+```
+decode -lib /path/to/libLiteRt -model gemma-4-E2B-it.litertlm -chat -text "..." -spec
+```
+
 Dump a model's signatures (names, element types, shapes):
 
 ```
@@ -101,12 +114,15 @@ spike -lib ... -model ... -backend cpu -smoke -sig decode
 
 - CPU only. `-backend gpu` selects LiteRT's default GPU backend; forcing the
   OpenCL backend needs opaque GPU options that are not bound.
-- Greedy decode only — no temperature/top-k/top-p sampling or speculative decoding.
-- Token-ID-input models only. Multi-section containers select the
-  `tf_lite_prefill_decode` section automatically (other sections — embedder, MTP
-  drafter, vision/audio adapters — are identified by their `model_type` hint),
-  but models whose main graph consumes embeddings (Gemma 3n/4: a separate
-  `tf_lite_embedder` stage and i8 KV cache) are not yet wired.
+- Greedy decode only — no temperature/top-k/top-p sampling. MTP speculative
+  decoding (`-spec`) is exact (greedy-equivalent output) and accepts multiple
+  tokens per verify pass, but is CPU break-even: the wide verify pass costs ~K×
+  a decode on CPU, so the win needs a GPU backend (where it parallelizes).
+- Text only, single turn. Both token-input models (gemma3, qwen3, …) and
+  embedding-input models (Gemma 3n/4, which run separate text + per-layer
+  embedder stages into the main graph) are supported. Multi-section containers
+  select sections by their `model_type` hint; the vision/audio adapter sections
+  are identified but not yet driven.
 
 ## Build
 

@@ -30,6 +30,7 @@ func main() {
 	backend := flag.String("backend", "none", "compile backend: none | cpu | gpu")
 	smoke := flag.Bool("smoke", false, "run one inference with zeroed inputs (proves the call path; output is meaningless)")
 	sigName := flag.String("sig", "decode", "signature key to smoke-run")
+	section := flag.String("section", "", "TFLiteModel model_type to introspect (e.g. tf_lite_embedder); default is the prefill/decode graph")
 	flag.Parse()
 
 	if *modelPath == "" {
@@ -37,13 +38,13 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
-	if err := run(*libDir, *modelPath, *backend, *sigName, *smoke); err != nil {
+	if err := run(*libDir, *modelPath, *backend, *sigName, *section, *smoke); err != nil {
 		fmt.Fprintln(os.Stderr, "spike:", err)
 		os.Exit(1)
 	}
 }
 
-func run(libDir, modelPath, backend, sigName string, smoke bool) error {
+func run(libDir, modelPath, backend, sigName, section string, smoke bool) error {
 	if err := litert.Load(libDir); err != nil {
 		return err
 	}
@@ -91,7 +92,12 @@ func run(libDir, modelPath, backend, sigName string, smoke bool) error {
 			}
 			fmt.Println()
 		}
-		tflite, err := litertlm.SectionTFLite(raw)
+		var tflite []byte
+		if section != "" {
+			tflite, err = litertlm.SectionTFLiteModelType(raw, section)
+		} else {
+			tflite, err = litertlm.SectionTFLite(raw)
+		}
 		if err != nil {
 			return err
 		}
