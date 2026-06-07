@@ -43,10 +43,12 @@ out, _ := eng.Generate("What is the capital of France?", true /* chat */, lm.Gen
 // Streaming (Generate/Send have token-by-token variants):
 _, _ = eng.GenerateStream("…", true, lm.GenOptions{MaxTokens: 64}, func(piece string) { fmt.Print(piece) })
 
-// Multi-turn, with sampling:
-chat, _ := eng.NewChat(lm.GenOptions{MaxTokens: 64, Temp: 0.8, TopK: 40})
-reply, _ := chat.Send("My name is Vlad.")
-reply, _ = chat.SendStream("What is my name?", func(piece string) { fmt.Print(piece) })
+// Multi-turn (NewConversation picks a KV-reuse Session for token-input models,
+// a re-prefill Chat for embedding-input models):
+conv, _ := eng.NewConversation(lm.GenOptions{MaxTokens: 64, Temp: 0.8, TopK: 40})
+defer conv.Close()
+reply, _ := conv.Send("My name is Vlad.")
+reply, _ = conv.SendStream("What is my name?", func(piece string) { fmt.Print(piece) })
 ```
 
 `GenOptions.Spec` enables MTP speculative decoding when the model supports it
@@ -162,11 +164,12 @@ spike -lib ... -model ... -backend cpu -smoke -sig decode
   on CPU, so the win needs a GPU backend (where it parallelizes).
 - Text only. Both token-input models (gemma3, qwen3, …) and embedding-input
   models (Gemma 3n/4, which run separate text + per-layer embedder stages into
-  the main graph) are supported; `-repl` is interactive multi-turn chat (the full
-  history is re-rendered and re-prefilled each turn, bounded by the prefill bucket
-  size — KV is not carried across turns). Multi-section containers select sections
-  by their `model_type` hint; the vision/audio adapter sections are identified but
-  not yet driven.
+  the main graph) are supported. `-repl` is interactive multi-turn chat: token-input
+  models use a KV-reuse `Session` (each turn ingests only its new tokens), while
+  embedding-input models fall back to re-rendering and re-prefilling the history
+  each turn (bounded by the prefill bucket size). Multi-section containers select
+  sections by their `model_type` hint; the vision/audio adapter sections are
+  identified but not yet driven.
 
 ## Build
 

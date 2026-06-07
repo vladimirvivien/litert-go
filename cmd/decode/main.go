@@ -81,10 +81,11 @@ func main() {
 // runRepl is an interactive multi-turn chat loop: each stdin line is a user
 // turn; the reply is printed and kept for context.
 func runRepl(eng *lm.Engine, o lm.GenOptions) error {
-	chat, err := eng.NewChat(o)
+	chat, err := eng.NewConversation(o)
 	if err != nil {
 		return err
 	}
+	defer chat.Close()
 	sc := bufio.NewScanner(os.Stdin)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	fmt.Fprint(os.Stderr, "> ")

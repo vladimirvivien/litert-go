@@ -255,6 +255,10 @@ func (e *Engine) NewChat(o GenOptions) (*Chat, error) {
 	return &Chat{e: e, o: o, tpl: tpl}, nil
 }
 
+// Close releases the Chat. Chat holds no resources of its own (the Engine owns
+// the model); it exists to satisfy Conversation.
+func (c *Chat) Close() {}
+
 // Send adds a user message and returns the model's reply, retaining both for
 // context on subsequent calls.
 func (c *Chat) Send(userText string) (string, error) {
@@ -286,6 +290,146 @@ func (c *Chat) send(userText string, onPiece func(string)) (string, error) {
 	}
 	c.hist = append(c.hist, turn{role: "model", text: reply})
 	return reply, nil
+}
+
+// Conversation is a multi-turn chat session. Both Chat (re-prefills the history
+// each turn) and Session (reuses the KV cache across turns) satisfy it.
+type Conversation interface {
+	Send(userText string) (string, error)
+	SendStream(userText string, onPiece func(string)) (string, error)
+	Close()
+}
+
+// NewConversation starts a multi-turn chat with the most efficient available
+// strategy: a KV-reuse Session for token-input models, a re-prefill Chat for
+// embedding-input models. Call Close on the result if it is a *Session.
+func (e *Engine) NewConversation(o GenOptions) (Conversation, error) {
+	if e.tok != nil && e.HasChatTemplate() && !sigHasInput(e.decode, "embeddings") {
+		return e.NewSession(o)
+	}
+	return e.NewChat(o)
+}
+
+// Session is a multi-turn chat that keeps the KV cache across turns: each turn
+// ingests only its new tokens at the cached position instead of re-prefilling
+// the whole history. Token-input models only. Close releases the cache.
+type Session struct {
+	e       *Engine
+	o       GenOptions
+	tpl     litertlm.PromptTemplates
+	stop    map[int32]bool
+	kv      map[string]litert.TensorBuffer
+	dec     *decoder
+	pos     int
+	started bool
+}
+
+// NewSession starts a KV-reuse chat session. It fails for embedding-input models
+// (use NewChat / NewConversation).
+func (e *Engine) NewSession(o GenOptions) (*Session, error) {
+	if e.tok == nil {
+		return nil, fmt.Errorf("lm: model has no tokenizer")
+	}
+	if sigHasInput(e.decode, "embeddings") {
+		return nil, fmt.Errorf("lm: NewSession supports token-input models only")
+	}
+	tpl, ok := e.md.Templates()
+	if !ok {
+		return nil, fmt.Errorf("lm: model has no chat template (model type %q)", e.md.ModelType)
+	}
+	s := &Session{e: e, o: o, tpl: tpl, stop: stopSet(e.tok, e.md), kv: map[string]litert.TensorBuffer{}}
+	for _, name := range e.prefill.inNames {
+		if !isKV(name) {
+			continue
+		}
+		buf, err := allocReqInput(e.env, e.cm, e.prefill, name)
+		if err != nil {
+			s.Close()
+			return nil, fmt.Errorf("alloc %s: %w", name, err)
+		}
+		s.kv[name] = buf
+	}
+	dec, err := newDecoder(e.env, e.cm, e.decode, s.kv, newSampler(o.Temp, o.TopK, o.TopP, o.Seed))
+	if err != nil {
+		s.Close()
+		return nil, err
+	}
+	s.dec = dec
+	return s, nil
+}
+
+// Close releases the session's KV cache and decode buffers.
+func (s *Session) Close() {
+	if s.dec != nil {
+		s.dec.close()
+	}
+	for _, b := range s.kv {
+		b.Close()
+	}
+}
+
+// Send adds a user message and returns the reply.
+func (s *Session) Send(userText string) (string, error) { return s.send(userText, nil) }
+
+// SendStream is Send with incremental output.
+func (s *Session) SendStream(userText string, onPiece func(string)) (string, error) {
+	return s.send(userText, onPiece)
+}
+
+func (s *Session) send(userText string, onPiece func(string)) (string, error) {
+	// Render the new turn. The first turn carries the start token; later turns
+	// first close the previous model turn with its suffix.
+	render := s.tpl.User.Prefix + userText + s.tpl.User.Suffix + s.tpl.Model.Prefix
+	var ids []int32
+	if !s.started {
+		ids = startIDs(s.e.tok, s.e.md)
+		s.started = true
+	} else {
+		render = s.tpl.Model.Suffix + render
+	}
+	for _, t := range s.e.tok.Encode(render) {
+		ids = append(ids, int32(t.ID))
+	}
+	if len(ids) == 0 {
+		return "", fmt.Errorf("empty turn")
+	}
+
+	// Ingest the turn tokens; the last one's logits start the reply.
+	pos := s.pos
+	for _, id := range ids {
+		if err := s.dec.feed(id, pos); err != nil {
+			return "", err
+		}
+		pos++
+	}
+	id, err := s.dec.sample()
+	if err != nil {
+		return "", err
+	}
+
+	var stream func(int32)
+	if onPiece != nil {
+		stream = s.e.streamer(onPiece)
+	}
+	var gen []int
+	for g := 0; g < s.o.MaxTokens; g++ {
+		if s.stop[id] {
+			break
+		}
+		gen = append(gen, int(id))
+		if stream != nil {
+			stream(id)
+		}
+		if err := s.dec.feed(id, pos); err != nil {
+			return "", err
+		}
+		pos++
+		if id, err = s.dec.sample(); err != nil {
+			return "", err
+		}
+	}
+	s.pos = pos
+	return s.e.tok.Decode(gen), nil
 }
 
 // --- signatures ---
@@ -621,20 +765,29 @@ func newDecoder(env litert.Environment, cm litert.CompiledModel, g sig, kv map[s
 	return d, nil
 }
 
-func (d *decoder) step(token int32, pos int) (int32, error) {
+// feed writes one token at pos and runs the model, leaving logits in d.logits.
+// It does not sample — used to ingest known tokens into the KV cache.
+func (d *decoder) feed(token int32, pos int) error {
 	if err := writeInts(d.tokens, []int32{token}); err != nil {
-		return 0, err
+		return err
 	}
 	if err := writeInts(d.posBuf, []int32{int32(pos)}); err != nil {
-		return 0, err
+		return err
 	}
 	if err := fillCausalMask(d.mask, 1, d.ctx, pos); err != nil {
+		return err
+	}
+	return d.runner.Run()
+}
+
+// sample picks the next token from the logits of the most recent feed.
+func (d *decoder) sample() (int32, error) { return d.smp.sample(d.logits, d.vocab) }
+
+func (d *decoder) step(token int32, pos int) (int32, error) {
+	if err := d.feed(token, pos); err != nil {
 		return 0, err
 	}
-	if err := d.runner.Run(); err != nil {
-		return 0, err
-	}
-	return d.smp.sample(d.logits, d.vocab)
+	return d.sample()
 }
 
 func (d *decoder) close() {
