@@ -273,7 +273,7 @@ func decodeSpeculative(env litert.Environment, cm litert.CompiledModel, fileByte
 		return nil, fmt.Errorf("prefill: %w", err)
 	}
 
-	dec, err := newEmbedDecoder(env, cm, decode, kv, emb, ple)
+	dec, err := newEmbedDecoder(env, cm, decode, kv, emb, ple, &sampler{}) // greedy
 	if err != nil {
 		return nil, fmt.Errorf("decode setup: %w", err)
 	}

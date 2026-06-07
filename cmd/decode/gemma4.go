@@ -98,7 +98,7 @@ func (e *embedModel) close() {
 // decodeEmbeddingInput runs the gemma 3n/4 pipeline: compile the embedder
 // stage(s) from the container, allocate the i8 KV cache, prefill all but the
 // last prompt token, then greedily decode from the held-back token.
-func decodeEmbeddingInput(env litert.Environment, cm litert.CompiledModel, fileBytes []byte, prefill, decode sig, prompt []int32, ngen int, stop map[int32]bool, accel litert.HwAccelerator) ([]int, error) {
+func decodeEmbeddingInput(env litert.Environment, cm litert.CompiledModel, fileBytes []byte, prefill, decode sig, prompt []int32, ngen int, stop map[int32]bool, accel litert.HwAccelerator, smp *sampler) ([]int, error) {
 	opts, err := litert.NewOptions(accel)
 	if err != nil {
 		return nil, err
@@ -149,7 +149,7 @@ func decodeEmbeddingInput(env litert.Environment, cm litert.CompiledModel, fileB
 		return nil, fmt.Errorf("prefill: %w", err)
 	}
 
-	dec, err := newEmbedDecoder(env, cm, decode, kv, emb, ple)
+	dec, err := newEmbedDecoder(env, cm, decode, kv, emb, ple, smp)
 	if err != nil {
 		return nil, fmt.Errorf("decode setup: %w", err)
 	}
@@ -303,9 +303,10 @@ type embedDecoder struct {
 	vocab    int
 	actLen   int     // elements in the activations output (0 if absent)
 	pos      []int32 // scratch: single-element input_pos
+	smp      *sampler
 }
 
-func newEmbedDecoder(env litert.Environment, cm litert.CompiledModel, g sig, kv map[string]litert.TensorBuffer, emb, ple *embedModel) (*embedDecoder, error) {
+func newEmbedDecoder(env litert.Environment, cm litert.CompiledModel, g sig, kv map[string]litert.TensorBuffer, emb, ple *embedModel, smp *sampler) (*embedDecoder, error) {
 	in, err := allocNonKV(env, cm, g, false)
 	if err != nil {
 		return nil, err
@@ -315,7 +316,7 @@ func newEmbedDecoder(env litert.Environment, cm litert.CompiledModel, g sig, kv 
 		closeBufs(in)
 		return nil, err
 	}
-	d := &embedDecoder{emb: emb, ple: ple, in: in, out: out, pos: make([]int32, 1)}
+	d := &embedDecoder{emb: emb, ple: ple, in: in, out: out, pos: make([]int32, 1), smp: smp}
 
 	maskShape, _ := inputShape(g, "mask") // [1,1,1,ctx]
 	d.ctx = int(maskShape[3])
@@ -365,7 +366,7 @@ func (d *embedDecoder) step(token int32, pos int) (int32, error) {
 	if err := d.runner.Run(); err != nil {
 		return 0, err
 	}
-	return argmaxF32(d.out["logits"], d.vocab)
+	return d.smp.sample(d.out["logits"], d.vocab)
 }
 
 // stepAct is step plus the decode activations (the hidden state the MTP drafter

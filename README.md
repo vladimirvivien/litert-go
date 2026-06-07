@@ -44,6 +44,7 @@ cmd/decode/    text → prefill → greedy decode → text
   main.go        token-input pipeline (gemma3, qwen3, …) + chat templating
   gemma4.go      embedding-input pipeline (gemma 3n/4: dual embedders, i8 KV)
   spec.go        MTP speculative decoding (drafter + verify; -spec)
+  sample.go      temperature / top-k / top-p sampling
 cmd/spike/     signature dump, compile, and smoke-run a single signature
 cmd/repro/     ffi argument-pinning regression guard
 ```
@@ -72,6 +73,12 @@ decode -lib /path/to/libLiteRt -model model.litertlm -text "The capital of Franc
 
 `-text` uses the model's embedded SentencePiece tokenizer; `-prompt` takes
 comma-separated token IDs instead. `-n` caps the number of generated tokens.
+Decoding is greedy unless `-temp` is set, which enables temperature sampling
+with optional `-topk` / `-topp` (nucleus) and `-seed`:
+
+```
+decode -lib ... -model model.litertlm -chat -text "..." -temp 0.8 -topk 40 -topp 0.95
+```
 
 `-chat` wraps `-text` in the model's chat template, read from the container's
 `LlmMetadata` (`prompt_templates` affixes plus `start_token` / `stop_tokens`),
@@ -114,10 +121,11 @@ spike -lib ... -model ... -backend cpu -smoke -sig decode
 
 - CPU only. `-backend gpu` selects LiteRT's default GPU backend; forcing the
   OpenCL backend needs opaque GPU options that are not bound.
-- Greedy decode only — no temperature/top-k/top-p sampling. MTP speculative
-  decoding (`-spec`) is exact (greedy-equivalent output) and accepts multiple
-  tokens per verify pass, but is CPU break-even: the wide verify pass costs ~K×
-  a decode on CPU, so the win needs a GPU backend (where it parallelizes).
+- Sampling (`-temp` / `-topk` / `-topp` / `-seed`) on the standard decode paths;
+  greedy when `-temp 0` (the default). MTP speculative decoding (`-spec`) is
+  greedy-only and exact (greedy-equivalent output), accepting multiple tokens
+  per verify pass — but CPU break-even: the wide verify pass costs ~K× a decode
+  on CPU, so the win needs a GPU backend (where it parallelizes).
 - Text only, single turn. Both token-input models (gemma3, qwen3, …) and
   embedding-input models (Gemma 3n/4, which run separate text + per-layer
   embedder stages into the main graph) are supported. Multi-section containers

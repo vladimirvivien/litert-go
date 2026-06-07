@@ -39,6 +39,10 @@ func main() {
 	chat := flag.Bool("chat", false, "wrap -text in the model's chat template (from container metadata)")
 	backend := flag.String("backend", "cpu", "compile backend: cpu | gpu")
 	spec := flag.Bool("spec", false, "MTP speculative decoding (needs a verify signature + mtp_drafter section)")
+	temp := flag.Float64("temp", 0, "sampling temperature (0 = greedy)")
+	topK := flag.Int("topk", 0, "top-k sampling (0 = off)")
+	topP := flag.Float64("topp", 0, "top-p / nucleus sampling (0 = off)")
+	seed := flag.Int64("seed", 0, "sampling RNG seed")
 	flag.Parse()
 
 	if *modelPath == "" || (*text == "" && *promptCSV == "") {
@@ -51,7 +55,8 @@ func main() {
 		fmt.Fprintln(os.Stderr, "decode:", err)
 		os.Exit(2)
 	}
-	if err := run(*libDir, *modelPath, *text, *promptCSV, *ngen, *chat, accel, *spec); err != nil {
+	smp := newSampler(float32(*temp), *topK, float32(*topP), *seed)
+	if err := run(*libDir, *modelPath, *text, *promptCSV, *ngen, *chat, accel, *spec, smp); err != nil {
 		fmt.Fprintln(os.Stderr, "decode:", err)
 		os.Exit(1)
 	}
@@ -123,7 +128,7 @@ func loadSig(m litert.Model, idx int) (sig, error) {
 
 func isKV(name string) bool { return strings.HasPrefix(name, "kv_cache_") }
 
-func run(libDir, modelPath, text, promptCSV string, ngen int, chat bool, accel litert.HwAccelerator, spec bool) error {
+func run(libDir, modelPath, text, promptCSV string, ngen int, chat bool, accel litert.HwAccelerator, spec bool, smp *sampler) error {
 	if err := litert.Load(libDir); err != nil {
 		return err
 	}
@@ -214,9 +219,9 @@ func run(libDir, modelPath, text, promptCSV string, ngen int, chat bool, accel l
 	case spec:
 		gen, err = decodeSpeculative(env, cm, fileBytes, prefill, decode, verify, prompt, ngen, stop, accel)
 	case sigHasInput(decode, "embeddings"):
-		gen, err = decodeEmbeddingInput(env, cm, fileBytes, prefill, decode, prompt, ngen, stop, accel)
+		gen, err = decodeEmbeddingInput(env, cm, fileBytes, prefill, decode, prompt, ngen, stop, accel, smp)
 	default:
-		gen, err = decodeTokenInput(env, cm, prefill, decode, prompt, ngen, stop)
+		gen, err = decodeTokenInput(env, cm, prefill, decode, prompt, ngen, stop, smp)
 	}
 	if err != nil {
 		return err
@@ -239,7 +244,7 @@ func sigHasInput(g sig, name string) bool {
 // decodeTokenInput runs the static token-input pipeline (gemma3, qwen3, …):
 // allocate the KV cache once, prefill all but the last prompt token, then
 // greedily decode from the held-back token.
-func decodeTokenInput(env litert.Environment, cm litert.CompiledModel, prefill, decode sig, prompt []int32, ngen int, stop map[int32]bool) ([]int, error) {
+func decodeTokenInput(env litert.Environment, cm litert.CompiledModel, prefill, decode sig, prompt []int32, ngen int, stop map[int32]bool, smp *sampler) ([]int, error) {
 	kv := map[string]litert.TensorBuffer{}
 	defer func() {
 		for _, b := range kv {
@@ -262,7 +267,7 @@ func decodeTokenInput(env litert.Environment, cm litert.CompiledModel, prefill, 
 		return nil, fmt.Errorf("prefill: %w", err)
 	}
 
-	dec, err := newDecoder(env, cm, decode, kv)
+	dec, err := newDecoder(env, cm, decode, kv, smp)
 	if err != nil {
 		return nil, fmt.Errorf("decode setup: %w", err)
 	}
@@ -433,10 +438,11 @@ type decoder struct {
 	runner *litert.Runner
 	ctx    int
 	vocab  int
+	smp    *sampler
 }
 
-func newDecoder(env litert.Environment, cm litert.CompiledModel, g sig, kv map[string]litert.TensorBuffer) (*decoder, error) {
-	d := &decoder{}
+func newDecoder(env litert.Environment, cm litert.CompiledModel, g sig, kv map[string]litert.TensorBuffer, smp *sampler) (*decoder, error) {
+	d := &decoder{smp: smp}
 	var err error
 	if d.tokens, err = allocReqInput(env, cm, g, "tokens"); err != nil {
 		return nil, err
@@ -492,7 +498,7 @@ func (d *decoder) step(token int32, pos int) (int32, error) {
 	if err := d.runner.Run(); err != nil {
 		return 0, err
 	}
-	return argmaxF32(d.logits, d.vocab)
+	return d.smp.sample(d.logits, d.vocab)
 }
 
 func (d *decoder) close() {
