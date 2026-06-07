@@ -91,6 +91,14 @@ decode -lib /path/to/libLiteRt -model model.litertlm -chat -text "What is the ca
 Containers that carry only a Jinja template (e.g. Gemma 4) fall back to the
 documented fixed affixes for that family, keyed on `llm_model_type`.
 
+`-repl` is interactive multi-turn chat: each stdin line is a user turn, the
+running history is re-rendered through the chat template and decoded, and the
+reply is kept for context.
+
+```
+decode -lib /path/to/libLiteRt -model model.litertlm -repl
+```
+
 `-spec` enables MTP speculative decoding on models that carry a `verify`
 signature and a `tf_lite_mtp_drafter` section (Gemma 4): the drafter proposes K
 tokens, the base model verifies them in one pass, and the matching prefix is
@@ -126,11 +134,13 @@ spike -lib ... -model ... -backend cpu -smoke -sig decode
   greedy-only and exact (greedy-equivalent output), accepting multiple tokens
   per verify pass — but CPU break-even: the wide verify pass costs ~K× a decode
   on CPU, so the win needs a GPU backend (where it parallelizes).
-- Text only, single turn. Both token-input models (gemma3, qwen3, …) and
-  embedding-input models (Gemma 3n/4, which run separate text + per-layer
-  embedder stages into the main graph) are supported. Multi-section containers
-  select sections by their `model_type` hint; the vision/audio adapter sections
-  are identified but not yet driven.
+- Text only. Both token-input models (gemma3, qwen3, …) and embedding-input
+  models (Gemma 3n/4, which run separate text + per-layer embedder stages into
+  the main graph) are supported; `-repl` is interactive multi-turn chat (the full
+  history is re-rendered and re-prefilled each turn, bounded by the prefill bucket
+  size — KV is not carried across turns). Multi-section containers select sections
+  by their `model_type` hint; the vision/audio adapter sections are identified but
+  not yet driven.
 
 ## Build
 

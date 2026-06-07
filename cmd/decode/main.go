@@ -12,6 +12,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"flag"
 	"fmt"
@@ -43,10 +44,11 @@ func main() {
 	topK := flag.Int("topk", 0, "top-k sampling (0 = off)")
 	topP := flag.Float64("topp", 0, "top-p / nucleus sampling (0 = off)")
 	seed := flag.Int64("seed", 0, "sampling RNG seed")
+	repl := flag.Bool("repl", false, "interactive multi-turn chat: read user turns from stdin")
 	flag.Parse()
 
-	if *modelPath == "" || (*text == "" && *promptCSV == "") {
-		fmt.Fprintln(os.Stderr, "decode: -model and one of -text/-prompt are required")
+	if *modelPath == "" || (!*repl && *text == "" && *promptCSV == "") {
+		fmt.Fprintln(os.Stderr, "decode: -model and one of -text/-prompt (or -repl) are required")
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -56,7 +58,7 @@ func main() {
 		os.Exit(2)
 	}
 	smp := newSampler(float32(*temp), *topK, float32(*topP), *seed)
-	if err := run(*libDir, *modelPath, *text, *promptCSV, *ngen, *chat, accel, *spec, smp); err != nil {
+	if err := run(*libDir, *modelPath, *text, *promptCSV, *ngen, *chat, accel, *spec, smp, *repl); err != nil {
 		fmt.Fprintln(os.Stderr, "decode:", err)
 		os.Exit(1)
 	}
@@ -128,7 +130,7 @@ func loadSig(m litert.Model, idx int) (sig, error) {
 
 func isKV(name string) bool { return strings.HasPrefix(name, "kv_cache_") }
 
-func run(libDir, modelPath, text, promptCSV string, ngen int, chat bool, accel litert.HwAccelerator, spec bool, smp *sampler) error {
+func run(libDir, modelPath, text, promptCSV string, ngen int, chat bool, accel litert.HwAccelerator, spec bool, smp *sampler, repl bool) error {
 	if err := litert.Load(libDir); err != nil {
 		return err
 	}
@@ -205,34 +207,109 @@ func run(libDir, modelPath, text, promptCSV string, ngen int, chat bool, accel l
 	}
 	defer cm.Close()
 
+	stop := stopSet(tok, md)
+
+	// generate runs one prompt through whichever path the model needs: token-input
+	// (gemma3, qwen3, …), embedding-input (gemma 3n/4), or MTP speculative (-spec).
+	generate := func(prompt []int32) ([]int, error) {
+		switch {
+		case spec:
+			return decodeSpeculative(env, cm, fileBytes, prefill, decode, verify, prompt, ngen, stop, accel)
+		case sigHasInput(decode, "embeddings"):
+			return decodeEmbeddingInput(env, cm, fileBytes, prefill, decode, prompt, ngen, stop, accel, smp)
+		default:
+			return decodeTokenInput(env, cm, prefill, decode, prompt, ngen, stop, smp)
+		}
+	}
+
+	if repl {
+		return runRepl(tok, md, generate)
+	}
+
 	prompt, err := buildPrompt(tok, md, text, promptCSV, chat)
 	if err != nil {
 		return err
 	}
-	stop := stopSet(tok, md)
-
-	// Token-input models (gemma3, qwen3, …) feed token IDs directly. Models with
-	// an "embeddings" input (gemma 3n/4) run a separate embedder stage first;
-	// with -spec and an mtp_drafter section they use MTP speculative decoding.
-	var gen []int
-	switch {
-	case spec:
-		gen, err = decodeSpeculative(env, cm, fileBytes, prefill, decode, verify, prompt, ngen, stop, accel)
-	case sigHasInput(decode, "embeddings"):
-		gen, err = decodeEmbeddingInput(env, cm, fileBytes, prefill, decode, prompt, ngen, stop, accel, smp)
-	default:
-		gen, err = decodeTokenInput(env, cm, prefill, decode, prompt, ngen, stop, smp)
-	}
+	gen, err := generate(prompt)
 	if err != nil {
 		return err
 	}
-
 	if tok != nil {
 		fmt.Printf("prompt: %q\noutput: %q\n", text, tok.Decode(gen))
 	} else {
 		fmt.Printf("prompt=%v\noutput tokens=%v\n", prompt, gen)
 	}
 	return nil
+}
+
+// turn is one message in a multi-turn conversation.
+type turn struct {
+	role string // "user", "model", "system"
+	text string
+}
+
+// buildConversation renders a chat history into prompt token IDs: the start
+// token, then each turn wrapped in its role affixes, then the model prefix to
+// open the assistant's reply. The whole conversation is encoded as one string
+// so control-token boundaries tokenize correctly.
+func buildConversation(tok *sentencepiece.Processor, md litertlm.Metadata, tpl litertlm.PromptTemplates, hist []turn) []int32 {
+	affix := func(role string) litertlm.Affixes {
+		switch role {
+		case "model":
+			return tpl.Model
+		case "system":
+			return tpl.System
+		default:
+			return tpl.User
+		}
+	}
+	var sb strings.Builder
+	for _, h := range hist {
+		a := affix(h.role)
+		sb.WriteString(a.Prefix)
+		sb.WriteString(h.text)
+		sb.WriteString(a.Suffix)
+	}
+	sb.WriteString(tpl.Model.Prefix)
+
+	ids := startIDs(tok, md)
+	for _, t := range tok.Encode(sb.String()) {
+		ids = append(ids, int32(t.ID))
+	}
+	return ids
+}
+
+// runRepl is an interactive multi-turn chat loop: each stdin line is a user
+// turn, the full history is re-rendered and decoded, and the reply is appended.
+func runRepl(tok *sentencepiece.Processor, md litertlm.Metadata, generate func([]int32) ([]int, error)) error {
+	if tok == nil {
+		return fmt.Errorf("repl: model has no SentencePiece tokenizer")
+	}
+	tpl, ok := md.Templates()
+	if !ok {
+		return fmt.Errorf("repl: model has no chat template (model type %q)", md.ModelType)
+	}
+	var hist []turn
+	sc := bufio.NewScanner(os.Stdin)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	fmt.Fprint(os.Stderr, "> ")
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			fmt.Fprint(os.Stderr, "> ")
+			continue
+		}
+		hist = append(hist, turn{role: "user", text: line})
+		gen, err := generate(buildConversation(tok, md, tpl, hist))
+		if err != nil {
+			return err
+		}
+		reply := tok.Decode(gen)
+		hist = append(hist, turn{role: "model", text: reply})
+		fmt.Println(reply)
+		fmt.Fprint(os.Stderr, "> ")
+	}
+	return sc.Err()
 }
 
 // sigHasInput reports whether the signature has an input tensor of the given name.
