@@ -171,11 +171,20 @@ spike -lib ... -model ... -backend cpu -smoke -sig decode
   sections by their `model_type` hint; the vision/audio adapter sections are
   identified but not yet driven.
 
-## Build
+## Build & test
 
 ```
 go build ./...
 go vet ./...
+go test ./...
+```
+
+Unit tests run without hardware. The `lm` package also has an env-gated
+integration test against a real model (greedy determinism, stream ≡ non-stream,
+`Session` ≡ `Generate`, seeded sampling, multi-turn):
+
+```
+LITERT_LIB=/abs/lib LITERT_LM_MODEL=/abs/model.litertlm go test ./lm
 ```
 
 ## Benchmarks
