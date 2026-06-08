@@ -40,6 +40,17 @@ func main() {
 		for _, s := range secs {
 			fmt.Printf("  %-18s items=%v\n", s.TypeName(), s.Items)
 		}
+		if md, merr := litertlm.ReadMetadata(raw); merr == nil {
+			fmt.Printf("metadata: model_type=%s start=%+v stops=%+v hasPrompts=%v\n",
+				md.ModelType, md.StartToken, md.StopTokens, md.HasPrompts)
+			if tpl, ok := md.Templates(); ok {
+				fmt.Printf("  user:   prefix=%q suffix=%q\n", tpl.User.Prefix, tpl.User.Suffix)
+				fmt.Printf("  model:  prefix=%q suffix=%q\n", tpl.Model.Prefix, tpl.Model.Suffix)
+				fmt.Printf("  system: prefix=%q suffix=%q\n", tpl.System.Prefix, tpl.System.Suffix)
+			} else {
+				fmt.Println("  (no chat template)")
+			}
+		}
 		if tflite, err = litertlm.SectionTFLite(raw); err != nil {
 			panic(err)
 		}

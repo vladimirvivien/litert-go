@@ -493,7 +493,7 @@ func (s *Session) send(userText string, onPiece func(string)) (string, error) {
 		ids = startIDs(s.e.tok, s.e.md)
 		s.started = true
 	} else {
-		render = s.tpl.Model.Suffix + render
+		render = modelBoundary(s.e.md, s.tpl) + render
 	}
 	ids = append(ids, s.e.tok.Encode(render)...)
 	if len(ids) == 0 {
@@ -768,11 +768,31 @@ func buildConversation(tok tokenizer, md litertlm.Metadata, tpl litertlm.PromptT
 		a := affix(h.role)
 		sb.WriteString(a.Prefix)
 		sb.WriteString(h.text)
-		sb.WriteString(a.Suffix)
+		if h.role == "model" {
+			sb.WriteString(modelBoundary(md, tpl))
+		} else {
+			sb.WriteString(a.Suffix)
+		}
 	}
 	sb.WriteString(tpl.Model.Prefix)
 
 	return append(startIDs(tok, md), tok.Encode(sb.String())...)
+}
+
+// modelBoundary returns the text that closes an assistant turn before the next
+// turn: the model affix suffix, or — when a model leaves that empty (e.g. phi-4)
+// — the first stop-token string, so the assistant turn stays delimited in
+// multi-turn context.
+func modelBoundary(md litertlm.Metadata, tpl litertlm.PromptTemplates) string {
+	if tpl.Model.Suffix != "" {
+		return tpl.Model.Suffix
+	}
+	for _, st := range md.StopTokens {
+		if st.Str != "" {
+			return st.Str
+		}
+	}
+	return ""
 }
 
 // startIDs returns the start token IDs to prepend: the metadata start_token when

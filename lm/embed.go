@@ -459,7 +459,7 @@ func (s *embedSession) send(userText string, onPiece func(string)) (string, erro
 		ids = startIDs(s.e.tok, s.e.md)
 		s.started = true
 	} else {
-		render = s.tpl.Model.Suffix + render
+		render = modelBoundary(s.e.md, s.tpl) + render
 	}
 	ids = append(ids, s.e.tok.Encode(render)...)
 	if len(ids) == 0 {
