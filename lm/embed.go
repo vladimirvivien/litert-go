@@ -457,6 +457,7 @@ func (s *embedSession) send(userText string, onPiece func(string)) (string, erro
 	var ids []int32
 	if !s.started {
 		ids = startIDs(s.e.tok, s.e.md)
+		render = renderSystem(s.tpl, s.o.System) + render
 		s.started = true
 	} else {
 		render = modelBoundary(s.e.md, s.tpl) + render

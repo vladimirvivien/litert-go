@@ -263,6 +263,7 @@ type GenOptions struct {
 	TopP      float32 // top-p / nucleus filter; 0 = off
 	Seed      int64   // sampling RNG seed
 	Spec      bool    // use MTP speculative decoding when available (greedy only)
+	System    string  // optional system prompt, rendered at the conversation start (chat only)
 }
 
 // Generate completes prompt and returns the generated text. When chat is true
@@ -271,7 +272,7 @@ func (e *Engine) Generate(prompt string, chat bool, o GenOptions) (string, error
 	if e.tok == nil {
 		return "", fmt.Errorf("lm: model has no tokenizer; use GenerateIDs")
 	}
-	ids, err := buildPrompt(e.tok, e.md, prompt, chat)
+	ids, err := buildPrompt(e.tok, e.md, o.System, prompt, chat)
 	if err != nil {
 		return "", err
 	}
@@ -294,7 +295,7 @@ func (e *Engine) GenerateStream(prompt string, chat bool, o GenOptions, onPiece 
 	if e.tok == nil {
 		return "", fmt.Errorf("lm: model has no tokenizer; use GenerateIDs")
 	}
-	ids, err := buildPrompt(e.tok, e.md, prompt, chat)
+	ids, err := buildPrompt(e.tok, e.md, o.System, prompt, chat)
 	if err != nil {
 		return "", err
 	}
@@ -360,7 +361,11 @@ func (e *Engine) NewChat(o GenOptions) (*Chat, error) {
 	if !ok {
 		return nil, fmt.Errorf("lm: model has no chat template (model type %q)", e.md.ModelType)
 	}
-	return &Chat{e: e, o: o, tpl: tpl}, nil
+	c := &Chat{e: e, o: o, tpl: tpl}
+	if o.System != "" {
+		c.hist = append(c.hist, turn{role: "system", text: o.System})
+	}
+	return c, nil
 }
 
 // Close releases the Chat. Chat holds no resources of its own (the Engine owns
@@ -491,6 +496,7 @@ func (s *Session) send(userText string, onPiece func(string)) (string, error) {
 	var ids []int32
 	if !s.started {
 		ids = startIDs(s.e.tok, s.e.md)
+		render = renderSystem(s.tpl, s.o.System) + render
 		s.started = true
 	} else {
 		render = modelBoundary(s.e.md, s.tpl) + render
@@ -720,9 +726,9 @@ type turn struct {
 
 // buildPrompt tokenizes text: as a raw completion (start token + text) or, with
 // chat set, wrapped in the model's chat template.
-func buildPrompt(tok tokenizer, md litertlm.Metadata, text string, chat bool) ([]int32, error) {
+func buildPrompt(tok tokenizer, md litertlm.Metadata, system, text string, chat bool) ([]int32, error) {
 	if chat {
-		return buildChatPrompt(tok, md, text)
+		return buildChatPrompt(tok, md, system, text)
 	}
 	ids := append(startIDs(tok, md), tok.Encode(text)...)
 	if len(ids) == 0 {
@@ -731,16 +737,25 @@ func buildPrompt(tok tokenizer, md litertlm.Metadata, text string, chat bool) ([
 	return ids, nil
 }
 
+// renderSystem renders a system turn (System.Prefix + system + System.Suffix), or
+// empty when no system prompt is set.
+func renderSystem(tpl litertlm.PromptTemplates, system string) string {
+	if system == "" {
+		return ""
+	}
+	return tpl.System.Prefix + system + tpl.System.Suffix
+}
+
 // buildChatPrompt wraps userText in the model's single user turn: start ++
 // user.prefix ++ userText ++ user.suffix ++ model.prefix. The turn markers in
 // the affixes (e.g. <start_of_turn>) are user-defined tokenizer pieces, so
 // encoding the rendered string yields their single vocab IDs.
-func buildChatPrompt(tok tokenizer, md litertlm.Metadata, userText string) ([]int32, error) {
+func buildChatPrompt(tok tokenizer, md litertlm.Metadata, system, userText string) ([]int32, error) {
 	tpl, ok := md.Templates()
 	if !ok {
 		return nil, fmt.Errorf("no chat template for model type %q", md.ModelType)
 	}
-	rendered := tpl.User.Prefix + userText + tpl.User.Suffix + tpl.Model.Prefix
+	rendered := renderSystem(tpl, system) + tpl.User.Prefix + userText + tpl.User.Suffix + tpl.Model.Prefix
 	ids := append(startIDs(tok, md), tok.Encode(rendered)...)
 	if len(ids) < 2 {
 		return nil, fmt.Errorf("empty chat tokenization of %q", userText)

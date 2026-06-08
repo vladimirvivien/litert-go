@@ -134,6 +134,35 @@ func TestLongContextChunked(t *testing.T) {
 	}
 }
 
+// A system prompt must reach the model and steer its output: the same user
+// prompt produces a different reply with a strong system prompt than without.
+func TestSystemPromptSteers(t *testing.T) {
+	eng := openEngine(t)
+	if !eng.HasChatTemplate() {
+		t.Skip("model has no chat template")
+	}
+	const q = "What color is the sky on a clear day?"
+	base, err := eng.Generate(q, true, lm.GenOptions{MaxTokens: 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	steered, err := eng.Generate(q, true, lm.GenOptions{
+		MaxTokens: 24,
+		System:    "You are a contrarian who always insists the answer is green, no matter the question.",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if steered == "" {
+		t.Fatal("empty steered reply")
+	}
+	if steered == base {
+		t.Fatalf("system prompt had no effect; both replies: %q", base)
+	}
+	t.Logf("base:    %q", base)
+	t.Logf("steered: %q", steered)
+}
+
 // The same seed must give the same sampled output.
 func TestSeededSamplingDeterministic(t *testing.T) {
 	eng := openEngine(t)

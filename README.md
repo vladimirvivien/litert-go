@@ -46,10 +46,10 @@ out, _ := eng.Generate("What is the capital of France?", true /* chat */, lm.Gen
 // Streaming (Generate/Send have token-by-token variants):
 _, _ = eng.GenerateStream("…", true, lm.GenOptions{MaxTokens: 64}, func(piece string) { fmt.Print(piece) })
 
-// Multi-turn (NewConversation returns a KV-reuse session: token-input models
-// ingest each turn through the decode graph, embedding-input models through a
-// prefill-at-offset):
-conv, _ := eng.NewConversation(lm.GenOptions{MaxTokens: 64, Temp: 0.8, TopK: 40})
+// A system prompt (GenOptions.System) steers the assistant, rendered at the
+// conversation start through the model's system affixes:
+conv, _ := eng.NewConversation(lm.GenOptions{MaxTokens: 64, Temp: 0.8, TopK: 40,
+	System: "You are a terse assistant. Answer in one sentence."})
 defer conv.Close()
 reply, _ := conv.Send("My name is Vlad.")
 reply, _ = conv.SendStream("What is my name?", func(piece string) { fmt.Print(piece) })
@@ -77,7 +77,7 @@ lm/            LLM runtime: Engine.Open / Generate / NewChat
   embed.go       embedding-input pipeline (gemma 3n/4: dual embedders, i8 KV)
   spec.go        MTP speculative decoding (drafter + verify)
   sample.go      temperature / top-k / top-p sampling
-cmd/decode/    thin CLI over lm (-text / -prompt / -repl, -chat, -spec, sampling)
+cmd/decode/    thin CLI over lm (-text / -prompt / -repl, -chat, -system, -spec, sampling)
 cmd/siginfo/   dump a model's sections and signature prefill shapes
 cmd/spike/     signature dump, compile, and smoke-run a single signature
 cmd/repro/     ffi argument-pinning regression guard

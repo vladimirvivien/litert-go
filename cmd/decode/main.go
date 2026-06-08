@@ -30,6 +30,7 @@ func main() {
 	topP := flag.Float64("topp", 0, "top-p / nucleus sampling (0 = off)")
 	seed := flag.Int64("seed", 0, "sampling RNG seed")
 	repl := flag.Bool("repl", false, "interactive multi-turn chat: read user turns from stdin")
+	system := flag.String("system", "", "system prompt (chat/-repl only)")
 	flag.Parse()
 
 	if *modelPath == "" || (!*repl && *text == "" && *promptCSV == "") {
@@ -55,6 +56,7 @@ func main() {
 		TopP:      float32(*topP),
 		Seed:      *seed,
 		Spec:      *spec,
+		System:    *system,
 	}
 
 	switch {
