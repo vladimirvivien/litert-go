@@ -15,6 +15,7 @@ import (
 func main() {
 	lib := flag.String("lib", os.Getenv("LITERT_LIB"), "dir with libLiteRt")
 	model := flag.String("model", "", ".litertlm or .tflite")
+	section := flag.String("section", "", "inspect the TFLiteModel section with this model_type hint (e.g. tf_lite_vision_encoder)")
 	flag.Parse()
 
 	if err := litert.Load(*lib); err != nil {
@@ -51,7 +52,11 @@ func main() {
 				fmt.Println("  (no chat template)")
 			}
 		}
-		if tflite, err = litertlm.SectionTFLite(raw); err != nil {
+		if *section != "" {
+			if tflite, err = litertlm.SectionTFLiteModelType(raw, *section); err != nil {
+				panic(err)
+			}
+		} else if tflite, err = litertlm.SectionTFLite(raw); err != nil {
 			panic(err)
 		}
 	}
@@ -72,10 +77,30 @@ func main() {
 			name, _ := s.InputName(j)
 			names = append(names, name)
 		}
-		fmt.Printf("  [%d] %-16s inputs: %s\n", i, key, strings.Join(names, ", "))
-		for _, probe := range []string{"tokens", "embeddings", "input_pos", "mask"} {
-			if tt, err := s.InputType(probe); err == nil {
-				fmt.Printf("        %-12s %v\n", probe, tt.Shape)
+		fmt.Printf("  [%d] %-16s (%d inputs)\n", i, key, nin)
+		isKV := func(s string) bool { return strings.HasPrefix(s, "kv_cache_") }
+		for _, name := range names {
+			if isKV(name) {
+				continue
+			}
+			if tt, err := s.InputType(name); err == nil {
+				dyn := ""
+				for _, d := range tt.Shape {
+					if d <= 0 {
+						dyn = "  <-- DYNAMIC"
+					}
+				}
+				fmt.Printf("        in  %-22s %v%s\n", name, tt.Shape, dyn)
+			}
+		}
+		nout, _ := s.NumOutputs()
+		for j := 0; j < nout; j++ {
+			name, _ := s.OutputName(j)
+			if isKV(name) {
+				continue
+			}
+			if tt, err := s.OutputType(name); err == nil {
+				fmt.Printf("        out %-22s %v\n", name, tt.Shape)
 			}
 		}
 	}
