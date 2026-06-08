@@ -76,9 +76,10 @@ type Engine struct {
 	verify     sig
 	haveVerify bool
 	accel      litert.HwAccelerator
-	emb, ple   *embedModel    // text + per-layer embedder stages, compiled once on first use
-	embOpts    litert.Options // compile options backing emb/ple
-	lastText   string         // most recent streamed output (GenerateStream/SendStream)
+	emb, ple   *embedModel     // text + per-layer embedder stages, compiled once on first use
+	embOpts    litert.Options  // compile options backing emb/ple
+	vision     *visionPipeline // vision encoder + adapter, compiled once on first use
+	lastText   string          // most recent streamed output (GenerateStream/SendStream)
 }
 
 // Open loads libLiteRt from libDir (or the LITERT_LIB environment variable),
@@ -179,6 +180,9 @@ func (e *Engine) Close() {
 	}
 	if e.embOpts != 0 {
 		e.embOpts.Close()
+	}
+	if e.vision != nil {
+		e.vision.close()
 	}
 	if e.cm != 0 {
 		e.cm.Close()

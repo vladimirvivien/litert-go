@@ -49,6 +49,8 @@ const (
 	TFLiteEmbedder         = "tf_lite_embedder"
 	TFLitePerLayerEmbedder = "tf_lite_per_layer_embedder"
 	TFLiteMTPDrafter       = "tf_lite_mtp_drafter"
+	TFLiteVisionEncoder    = "tf_lite_vision_encoder"
+	TFLiteVisionAdapter    = "tf_lite_vision_adapter"
 )
 
 // vDataStringValue is the VData union tag for StringValue (schema enum order,
