@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/vladimirvivien/litert-go/audio"
 	"github.com/vladimirvivien/litert-go/litert"
 	"github.com/vladimirvivien/litert-go/lm"
 )
@@ -32,6 +33,7 @@ func main() {
 	repl := flag.Bool("repl", false, "interactive multi-turn chat: read user turns from stdin")
 	system := flag.String("system", "", "system prompt (chat/-repl only)")
 	image := flag.String("image", "", "image file; -text must contain <start_of_image> (gemma-4 vision)")
+	audioFile := flag.String("audio", "", "16kHz mono WAV; -text must contain <start_of_audio> (gemma-4 audio)")
 	flag.Parse()
 
 	if *modelPath == "" || (!*repl && *text == "" && *promptCSV == "") {
@@ -69,6 +71,17 @@ func main() {
 			var out string
 			if out, err = eng.GenerateFromImage(*text, data, 0, o); err == nil {
 				fmt.Printf("prompt: %q\noutput: %s\n", *text, out)
+			}
+		}
+	case *audioFile != "":
+		var data []byte
+		if data, err = os.ReadFile(*audioFile); err == nil {
+			var pcm []float32
+			if pcm, err = audio.DecodeWAV(data); err == nil {
+				var out string
+				if out, err = eng.GenerateFromAudio(*text, pcm, o); err == nil {
+					fmt.Printf("prompt: %q\noutput: %s\n", *text, out)
+				}
 			}
 		}
 	case *promptCSV != "":

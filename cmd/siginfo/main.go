@@ -90,7 +90,7 @@ func main() {
 						dyn = "  <-- DYNAMIC"
 					}
 				}
-				fmt.Printf("        in  %-22s %v%s\n", name, tt.Shape, dyn)
+				fmt.Printf("        in  %-22s %v %v%s\n", name, tt.ElementType, tt.Shape, dyn)
 			}
 		}
 		nout, _ := s.NumOutputs()
@@ -100,7 +100,7 @@ func main() {
 				continue
 			}
 			if tt, err := s.OutputType(name); err == nil {
-				fmt.Printf("        out %-22s %v\n", name, tt.Shape)
+				fmt.Printf("        out %-22s %v %v\n", name, tt.ElementType, tt.Shape)
 			}
 		}
 	}

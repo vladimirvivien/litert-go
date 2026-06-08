@@ -79,6 +79,7 @@ type Engine struct {
 	emb, ple   *embedModel     // text + per-layer embedder stages, compiled once on first use
 	embOpts    litert.Options  // compile options backing emb/ple
 	vision     *visionPipeline // vision encoder + adapter, compiled once on first use
+	audio      *audioPipeline  // audio encoder + adapter, compiled once on first use
 	lastText   string          // most recent streamed output (GenerateStream/SendStream)
 }
 
@@ -183,6 +184,9 @@ func (e *Engine) Close() {
 	}
 	if e.vision != nil {
 		e.vision.close()
+	}
+	if e.audio != nil {
+		e.audio.close()
 	}
 	if e.cm != 0 {
 		e.cm.Close()

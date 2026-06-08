@@ -51,6 +51,8 @@ const (
 	TFLiteMTPDrafter       = "tf_lite_mtp_drafter"
 	TFLiteVisionEncoder    = "tf_lite_vision_encoder"
 	TFLiteVisionAdapter    = "tf_lite_vision_adapter"
+	TFLiteAudioEncoder     = "tf_lite_audio_encoder_hw"
+	TFLiteAudioAdapter     = "tf_lite_audio_adapter"
 )
 
 // vDataStringValue is the VData union tag for StringValue (schema enum order,

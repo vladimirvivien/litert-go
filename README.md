@@ -51,10 +51,12 @@ _, _ = eng.GenerateStream("…", true, lm.GenOptions{MaxTokens: 64}, func(piece 
 conv, _ := eng.NewConversation(lm.GenOptions{MaxTokens: 64, Temp: 0.8, TopK: 40,
 	System: "You are a terse assistant. Answer in one sentence."})
 
-// Vision (gemma-4): generate text from a prompt + image; mark the image position
-// with <start_of_image>:
+// Vision/audio (gemma-4): generate text from a prompt + image/clip; mark the
+// position with <start_of_image> / <start_of_audio>:
 img, _ := os.ReadFile("photo.jpg")
 caption, _ := eng.GenerateFromImage("<start_of_image>Describe this image.", img, 0 /* budget */, lm.GenOptions{MaxTokens: 64})
+pcm, _ := audio.DecodeWAV(wavBytes) // 16kHz mono
+answer, _ := eng.GenerateFromAudio("<start_of_audio>What do you hear?", pcm, lm.GenOptions{MaxTokens: 64})
 defer conv.Close()
 reply, _ := conv.Send("My name is Vlad.")
 reply, _ = conv.SendStream("What is my name?", func(piece string) { fmt.Print(piece) })
@@ -78,13 +80,16 @@ litertlm/      .litertlm container reader (minimal FlatBuffer parser)
   metadata.go    ReadMetadata — model family + max tokens (protobuf scan)
 hftok/         pure-Go HuggingFace byte-level BPE tokenizer (Qwen, GPT-2 family)
 vision/        pure-Go image preprocessing (decode, aspect-resize, patchify)
-lm/            LLM runtime: Engine.Open / Generate / NewChat / GenerateImage
+audio/         pure-Go audio preprocessing (WAV decode, mel spectrogram, FFT)
+lm/            LLM runtime: Engine.Open / Generate / NewChat / GenerateFrom{Image,Audio}
   engine.go      Engine, tokenizer abstraction, chat templating, token-input decode
   embed.go       embedding-input pipeline (gemma 3n/4: dual embedders, i8 KV)
+  multimodal.go  shared vision/audio embedding splice (sentinel + markers)
   vision.go      gemma-4 vision: encoder + adapter, image-embedding splice
+  audio.go       gemma-4 audio: encoder + adapter, audio-embedding splice
   spec.go        MTP speculative decoding (drafter + verify)
   sample.go      temperature / top-k / top-p sampling
-cmd/decode/    thin CLI over lm (-text / -prompt / -repl, -chat, -system, -image, -spec, sampling)
+cmd/decode/    thin CLI over lm (-text / -prompt / -repl, -chat, -system, -image, -audio, -spec, sampling)
 cmd/siginfo/   dump a model's sections and signature prefill shapes
 cmd/spike/     signature dump, compile, and smoke-run a single signature
 cmd/repro/     ffi argument-pinning regression guard
@@ -185,11 +190,12 @@ spike -lib ... -model ... -backend cpu -smoke -sig decode
   that ingests only each turn's new tokens: token-input models through the decode
   graph, embedding-input models through a prefill-at-offset into the retained
   cache. Multi-section containers select sections by their `model_type` hint.
-- Vision (gemma-4): `GenerateImage` / `-image` runs the vision encoder + adapter
-  and splices the image embeddings into the prompt at a `<start_of_image>` marker.
-  Image preprocessing is gamma-space (not the reference's linear-sRGB resize), so
-  it is functionally correct but not bit-identical. Audio sections are present but
-  not yet driven.
+- Multimodal (gemma-4): `GenerateFromImage` / `-image` and `GenerateFromAudio` /
+  `-audio` run the vision/audio encoder + adapter and splice the embeddings into
+  the prompt at a `<start_of_image>` / `<start_of_audio>` marker. Image and audio
+  preprocessing are pure Go (gamma-space resize; hand-rolled FFT mel spectrogram);
+  functionally correct, validated qualitatively (no reference oracle). `DecodeWAV`
+  handles 16 kHz mono PCM16/float32.
 
 ## Build & test
 
