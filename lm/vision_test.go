@@ -7,6 +7,7 @@ import (
 	"image/png"
 	"math"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/vladimirvivien/litert-go/litert"
@@ -65,4 +66,48 @@ func TestVisionEncodeSmoke(t *testing.T) {
 		}
 	}
 	t.Logf("mm_embedding: %d tokens x %d", tokens, embDim)
+}
+
+// End-to-end: a solid-color image plus a "what color" prompt should yield a
+// color-aware reply. Qualitative (no C++ image oracle); the color match is
+// logged, the run must succeed and be non-empty.
+func TestGenerateFromImageSolidColor(t *testing.T) {
+	lib := os.Getenv("LITERT_LIB")
+	model := os.Getenv("LITERT_LM_EMBED_MODEL")
+	if lib == "" || model == "" {
+		t.Skip("set LITERT_LIB and LITERT_LM_EMBED_MODEL (a gemma-4 .litertlm with vision)")
+	}
+	eng, err := Open(lib, model, litert.AccelCPU)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(eng.Close)
+	if _, err := eng.ensureVision(); err != nil {
+		t.Skipf("model has no vision sections: %v", err)
+	}
+
+	img := image.NewRGBA(image.Rect(0, 0, 224, 224))
+	for y := 0; y < 224; y++ {
+		for x := 0; x < 224; x++ {
+			img.SetRGBA(x, y, color.RGBA{R: 220, G: 20, B: 20, A: 255}) // solid red
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := eng.GenerateFromImage(
+		"<start_of_image>What is the dominant color in this image? Answer in one word.",
+		buf.Bytes(), 70, GenOptions{MaxTokens: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out == "" {
+		t.Fatal("empty reply")
+	}
+	t.Logf("reply: %q", out)
+	if !strings.Contains(strings.ToLower(out), "red") {
+		t.Fatalf("reply did not identify the red image: %q", out)
+	}
 }

@@ -204,10 +204,21 @@ func closeBufs(bufs map[string]litert.TensorBuffer) {
 // param_tensor that begins the KV write at start. With start 0 it is a fresh
 // prefill; with start > 0 it appends a turn to an existing cache.
 func prefillEmbed(env litert.Environment, cm litert.CompiledModel, g sig, kv map[string]litert.TensorBuffer, emb, ple *embedModel, ids []int32, start int) error {
+	text, perLayer, err := embedTokens(emb, ple, ids)
+	if err != nil {
+		return err
+	}
+	return prefillEmbedFill(env, cm, g, kv, text, perLayer, len(ids), start)
+}
+
+// prefillEmbedFill ingests pre-computed text (and per-layer) embeddings for n
+// tokens into the KV cache at position start through bucket g. Used directly by
+// the multimodal path, which splices image embeddings into text before prefill.
+func prefillEmbedFill(env litert.Environment, cm litert.CompiledModel, g sig, kv map[string]litert.TensorBuffer, text, perLayer []float32, n, start int) error {
 	embShape, _ := inputShape(g, "embeddings") // [1, seq, H]
 	seq := int(embShape[1])
-	if len(ids) > seq {
-		return fmt.Errorf("prompt (%d) exceeds prefill bucket (%d)", len(ids), seq)
+	if n > seq {
+		return fmt.Errorf("prompt (%d) exceeds prefill bucket (%d)", n, seq)
 	}
 
 	bufs, err := allocNonKV(env, cm, g, false)
@@ -216,17 +227,12 @@ func prefillEmbed(env litert.Environment, cm litert.CompiledModel, g sig, kv map
 	}
 	defer closeBufs(bufs)
 
-	text, perLayer, err := embedTokens(emb, ple, ids)
-	if err != nil {
-		return err
-	}
 	maskShape, _ := inputShape(g, "mask") // [1,1,seq,ctx]
 	rows, ctx := int(maskShape[2]), int(maskShape[3])
 	pos := make([]int32, seq)
 	for i := range pos {
 		pos[i] = int32(start + i)
 	}
-	n := len(ids)
 
 	for name, b := range bufs {
 		if err := fillEmbedInput(b, name, text, perLayer, pos, rows, ctx, n, start); err != nil {
@@ -250,6 +256,33 @@ func prefillEmbedRun(env litert.Environment, cm litert.CompiledModel, pre prefil
 	off := 0
 	for _, c := range pre.plan(len(ids)) {
 		if err := prefillEmbed(env, cm, pre.sig[c.bucket], kv, emb, ple, ids[off:off+c.take], start+off); err != nil {
+			return err
+		}
+		off += c.take
+	}
+	return nil
+}
+
+// prefillEmbedDataRun ingests pre-computed text (and per-layer) embeddings for n
+// tokens into the KV cache at start, chunking across prefill buckets. text is
+// [n*H], perLayer is [n*L] (or empty).
+func prefillEmbedDataRun(env litert.Environment, cm litert.CompiledModel, pre prefiller, kv map[string]litert.TensorBuffer, text, perLayer []float32, n, start int) error {
+	if n == 0 {
+		return nil
+	}
+	h := len(text) / n
+	l := 0
+	if len(perLayer) > 0 {
+		l = len(perLayer) / n
+	}
+	off := 0
+	for _, c := range pre.plan(n) {
+		t := text[off*h : (off+c.take)*h]
+		var pl []float32
+		if l > 0 {
+			pl = perLayer[off*l : (off+c.take)*l]
+		}
+		if err := prefillEmbedFill(env, cm, pre.sig[c.bucket], kv, t, pl, c.take, start+off); err != nil {
 			return err
 		}
 		off += c.take

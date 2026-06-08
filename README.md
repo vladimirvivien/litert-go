@@ -50,6 +50,11 @@ _, _ = eng.GenerateStream("…", true, lm.GenOptions{MaxTokens: 64}, func(piece 
 // conversation start through the model's system affixes:
 conv, _ := eng.NewConversation(lm.GenOptions{MaxTokens: 64, Temp: 0.8, TopK: 40,
 	System: "You are a terse assistant. Answer in one sentence."})
+
+// Vision (gemma-4): generate text from a prompt + image; mark the image position
+// with <start_of_image>:
+img, _ := os.ReadFile("photo.jpg")
+caption, _ := eng.GenerateFromImage("<start_of_image>Describe this image.", img, 0 /* budget */, lm.GenOptions{MaxTokens: 64})
 defer conv.Close()
 reply, _ := conv.Send("My name is Vlad.")
 reply, _ = conv.SendStream("What is my name?", func(piece string) { fmt.Print(piece) })
@@ -72,12 +77,14 @@ litertlm/      .litertlm container reader (minimal FlatBuffer parser)
                  prefill/decode graph) / SectionBytes
   metadata.go    ReadMetadata — model family + max tokens (protobuf scan)
 hftok/         pure-Go HuggingFace byte-level BPE tokenizer (Qwen, GPT-2 family)
-lm/            LLM runtime: Engine.Open / Generate / NewChat
+vision/        pure-Go image preprocessing (decode, aspect-resize, patchify)
+lm/            LLM runtime: Engine.Open / Generate / NewChat / GenerateImage
   engine.go      Engine, tokenizer abstraction, chat templating, token-input decode
   embed.go       embedding-input pipeline (gemma 3n/4: dual embedders, i8 KV)
+  vision.go      gemma-4 vision: encoder + adapter, image-embedding splice
   spec.go        MTP speculative decoding (drafter + verify)
   sample.go      temperature / top-k / top-p sampling
-cmd/decode/    thin CLI over lm (-text / -prompt / -repl, -chat, -system, -spec, sampling)
+cmd/decode/    thin CLI over lm (-text / -prompt / -repl, -chat, -system, -image, -spec, sampling)
 cmd/siginfo/   dump a model's sections and signature prefill shapes
 cmd/spike/     signature dump, compile, and smoke-run a single signature
 cmd/repro/     ffi argument-pinning regression guard
@@ -172,14 +179,17 @@ spike -lib ... -model ... -backend cpu -smoke -sig decode
   Prefill covers the prompt by chunking across the model's prefill buckets — a
   short prompt uses the smallest bucket that fits; a long one uses repeated
   largest-bucket chunks plus a fitting remainder.
-- Text only. Both token-input models (gemma3, qwen3, …) and embedding-input
-  models (Gemma 3n/4, which run separate text + per-layer embedder stages into
-  the main graph) are supported. `-repl` is interactive multi-turn chat over a
-  KV-reuse session that ingests only each turn's new tokens: token-input models
-  through the decode graph, embedding-input models through a prefill-at-offset
-  into the retained cache. Multi-section containers select sections by their
-  `model_type` hint; the vision/audio adapter sections are identified but not yet
-  driven.
+- Both token-input models (gemma3, qwen3, …) and embedding-input models (Gemma
+  3n/4, which run separate text + per-layer embedder stages into the main graph)
+  are supported. `-repl` is interactive multi-turn chat over a KV-reuse session
+  that ingests only each turn's new tokens: token-input models through the decode
+  graph, embedding-input models through a prefill-at-offset into the retained
+  cache. Multi-section containers select sections by their `model_type` hint.
+- Vision (gemma-4): `GenerateImage` / `-image` runs the vision encoder + adapter
+  and splices the image embeddings into the prompt at a `<start_of_image>` marker.
+  Image preprocessing is gamma-space (not the reference's linear-sRGB resize), so
+  it is functionally correct but not bit-identical. Audio sections are present but
+  not yet driven.
 
 ## Build & test
 

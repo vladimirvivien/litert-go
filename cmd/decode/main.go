@@ -31,6 +31,7 @@ func main() {
 	seed := flag.Int64("seed", 0, "sampling RNG seed")
 	repl := flag.Bool("repl", false, "interactive multi-turn chat: read user turns from stdin")
 	system := flag.String("system", "", "system prompt (chat/-repl only)")
+	image := flag.String("image", "", "image file; -text must contain <start_of_image> (gemma-4 vision)")
 	flag.Parse()
 
 	if *modelPath == "" || (!*repl && *text == "" && *promptCSV == "") {
@@ -62,6 +63,14 @@ func main() {
 	switch {
 	case *repl:
 		err = runRepl(eng, o)
+	case *image != "":
+		var data []byte
+		if data, err = os.ReadFile(*image); err == nil {
+			var out string
+			if out, err = eng.GenerateFromImage(*text, data, 0, o); err == nil {
+				fmt.Printf("prompt: %q\noutput: %s\n", *text, out)
+			}
+		}
 	case *promptCSV != "":
 		var ids []int32
 		if ids, err = parseIDs(*promptCSV); err == nil {

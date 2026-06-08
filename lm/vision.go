@@ -240,6 +240,171 @@ func (v *visionPipeline) close() {
 	}
 }
 
+// imageMarker is the placeholder a prompt uses to position an image; it expands
+// to <start_of_image> + the image's soft-token sentinels + <end_of_image>.
+const imageMarker = "<start_of_image>"
+
+// visionSoftToken is the placeholder token id at each image position in the token
+// sequence (LiteRT-LM's ExecutorVisionData::kSpecialToken). Its `embeddings` row
+// is the image embedding; its per-layer embedding is left zero (the vision
+// adapter produces no per-layer output).
+const visionSoftToken int32 = -1
+
+// GenerateFromImage generates text for a prompt that references a single image.
+// The prompt must contain imageMarker ("<start_of_image>") where the image
+// belongs. budget is the visual-token budget (0 = default). Embedding-input
+// (gemma 3n/4) models with a vision stack only.
+func (e *Engine) GenerateFromImage(prompt string, imageData []byte, budget int, o GenOptions) (string, error) {
+	if e.tok == nil {
+		return "", fmt.Errorf("lm: model has no tokenizer")
+	}
+	if !sigHasInput(e.decode, "embeddings") {
+		return "", fmt.Errorf("lm: GenerateFromImage requires an embedding-input model")
+	}
+	emb, ple, err := e.ensureEmbedders()
+	if err != nil {
+		return "", err
+	}
+	vp, err := e.ensureVision()
+	if err != nil {
+		return "", err
+	}
+
+	patches, err := vision.Preprocess(imageData, budget)
+	if err != nil {
+		return "", err
+	}
+	mm, tReal, err := vp.encode(e.env, patches)
+	if err != nil {
+		return "", err
+	}
+
+	ids, err := e.buildImagePrompt(prompt, o.System, tReal)
+	if err != nil {
+		return "", err
+	}
+
+	h := emb.floats
+	if len(mm) != tReal*h {
+		return "", fmt.Errorf("lm: image embedding dim %d != text embedding dim %d", len(mm)/tReal, h)
+	}
+	text, perLayer, err := e.embedMultiModal(emb, ple, ids, mm, h)
+	if err != nil {
+		return "", err
+	}
+
+	gen, err := decodeMultiModal(e.env, e.cm, e.pre, e.decode, emb, ple, ids, text, perLayer,
+		o.MaxTokens, stopSet(e.tok, e.md), newSampler(o.Temp, o.TopK, o.TopP, o.Seed))
+	if err != nil {
+		return "", err
+	}
+	return e.tok.Decode(gen), nil
+}
+
+// buildImagePrompt renders the chat turn and inserts the image block at the
+// imageMarker position: <start_of_image>, tReal soft-token sentinels (-1),
+// <end_of_image>, at the token level.
+func (e *Engine) buildImagePrompt(prompt, system string, tReal int) ([]int32, error) {
+	tpl, ok := e.md.Templates()
+	if !ok {
+		return nil, fmt.Errorf("lm: model has no chat template (model type %q)", e.md.ModelType)
+	}
+	render := renderSystem(tpl, system) + tpl.User.Prefix + prompt + tpl.User.Suffix + tpl.Model.Prefix
+	before, after, found := strings.Cut(render, imageMarker)
+	if !found {
+		return nil, fmt.Errorf("lm: prompt has no %q marker", imageMarker)
+	}
+	ids := startIDs(e.tok, e.md)
+	ids = append(ids, e.tok.Encode(before+"<start_of_image>")...)
+	for i := 0; i < tReal; i++ {
+		ids = append(ids, visionSoftToken)
+	}
+	ids = append(ids, e.tok.Encode("<end_of_image>"+after)...)
+	return ids, nil
+}
+
+// embedMultiModal builds the text and per-layer embeddings for ids: real tokens
+// go through the text/per-layer embedders; visionSoftToken (-1) positions take
+// the next image row into text and leave per-layer zero.
+func (e *Engine) embedMultiModal(emb, ple *embedModel, ids []int32, mm []float32, h int) (text, perLayer []float32, err error) {
+	text = make([]float32, len(ids)*h)
+	l := 0
+	if ple != nil {
+		l = ple.floats
+		perLayer = make([]float32, len(ids)*l)
+	}
+	mmIdx := 0
+	for i, id := range ids {
+		if id == visionSoftToken {
+			copy(text[i*h:(i+1)*h], mm[mmIdx*h:(mmIdx+1)*h])
+			mmIdx++
+			continue
+		}
+		v, err := emb.embed(id)
+		if err != nil {
+			return nil, nil, err
+		}
+		copy(text[i*h:(i+1)*h], v)
+		if ple != nil {
+			w, err := ple.embed(id)
+			if err != nil {
+				return nil, nil, err
+			}
+			copy(perLayer[i*l:(i+1)*l], w)
+		}
+	}
+	return text, perLayer, nil
+}
+
+// decodeMultiModal prefills a prompt whose text embeddings already have the
+// image rows spliced in (text/perLayer cover all promptIDs), then decodes from
+// the held-back last token.
+func decodeMultiModal(env litert.Environment, cm litert.CompiledModel, pre prefiller, decode sig, emb, ple *embedModel, promptIDs []int32, text, perLayer []float32, ngen int, stop map[int32]bool, smp *sampler) ([]int, error) {
+	kv, err := allocKV(env, cm, pre.max())
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		for _, b := range kv {
+			b.Close()
+		}
+	}()
+
+	n := len(promptIDs)
+	h := len(text) / n
+	l := 0
+	if len(perLayer) > 0 {
+		l = len(perLayer) / n
+	}
+	p := n - 1
+	if err := prefillEmbedDataRun(env, cm, pre, kv, text[:p*h], perLayer[:p*l], p, 0); err != nil {
+		return nil, fmt.Errorf("prefill: %w", err)
+	}
+
+	dec, err := newEmbedDecoder(env, cm, decode, kv, emb, ple, smp)
+	if err != nil {
+		return nil, fmt.Errorf("decode setup: %w", err)
+	}
+	defer dec.close()
+
+	next := promptIDs[p]
+	pos := p
+	var gen []int
+	for g := 0; g < ngen; g++ {
+		id, err := dec.step(next, pos)
+		if err != nil {
+			return nil, fmt.Errorf("decode step %d: %w", g, err)
+		}
+		if stop[id] {
+			break
+		}
+		gen = append(gen, int(id))
+		next = id
+		pos++
+	}
+	return gen, nil
+}
+
 // readBytes copies the first n bytes of a buffer out to Go memory.
 func readBytes(b litert.TensorBuffer, n int) ([]byte, error) {
 	addr, err := b.Lock(litert.LockRead)
