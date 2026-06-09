@@ -241,16 +241,16 @@ func OpenModel(env Environment, path string) (Model, error) {
 
 // OpenModelFromBuffer loads a .tflite model from memory. The LiteRT C API keeps
 // a reference to the buffer for the model's lifetime, so the caller must keep
-// data alive until the returned Model is closed.
+// data alive until the returned Model is closed. The env argument is accepted for
+// API symmetry; LiteRT 2.1.5's LiteRtCreateModelFromBuffer does not take it.
 func OpenModelFromBuffer(env Environment, data []byte) (Model, error) {
+	_ = env
 	if len(data) == 0 {
 		return 0, fmt.Errorf("litert: empty model buffer")
 	}
 	var pin runtime.Pinner
 	defer pin.Unpin()
 
-	e := uintptr(env)
-	pin.Pin(&e)
 	pin.Pin(&data[0])
 	datap := unsafe.Pointer(&data[0])
 	pin.Pin(&datap)
@@ -262,7 +262,7 @@ func OpenModelFromBuffer(env Environment, data []byte) (Model, error) {
 	pin.Pin(&mp)
 
 	st := invoke(&pin, createModelFromBufferFunc,
-		unsafe.Pointer(&e), unsafe.Pointer(&datap), unsafe.Pointer(&n), unsafe.Pointer(&mp))
+		unsafe.Pointer(&datap), unsafe.Pointer(&n), unsafe.Pointer(&mp))
 	return Model(m), st.err("LiteRtCreateModelFromBuffer")
 }
 

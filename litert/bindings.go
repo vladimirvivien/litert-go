@@ -38,10 +38,11 @@ var (
 		&ffi.TypePointer, // const char* filename
 		&ffi.TypePointer, // LiteRtModel* model
 	)
+	// LiteRtCreateModelFromBuffer(buffer, size, model*). The distributed LiteRT
+	// 2.1.5 prebuilt has no leading LiteRtEnvironment argument.
 	createModelFromBufferFunc = newLazyFun(
 		"LiteRtCreateModelFromBuffer",
 		&ffi.TypeSint32,
-		&ffi.TypePointer, // LiteRtEnvironment
 		&ffi.TypePointer, // const void* buffer_addr
 		&ffi.TypeUint64,  // size_t buffer_size
 		&ffi.TypePointer, // LiteRtModel* model
