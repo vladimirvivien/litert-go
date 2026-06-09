@@ -139,7 +139,21 @@ func gpuCompileOptions(accel litert.HwAccelerator, modelKey, tag string) (litert
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return opts, nil
 	}
-	toml := fmt.Sprintf("model_cache_key = \"%s_%s\"\nserialization_dir = \"%s\"\nserialize_program_cache = true\n",
+	// These match the C++ engine's GPU cache settings and produce its compact
+	// split cache (a small program cache plus a separate weight cache) instead of a
+	// single multi-GB blob. enable_constant_tensors_sharing is load-bearing: it
+	// shares each constant (weight) tensor across the prefill-bucket and decode
+	// signatures, so the cache stores the weights once instead of per signature.
+	// serialize_external_tensors writes the deduplicated weights to the weight
+	// cache; serialize_program_cache writes the compiled programs. Warm starts then
+	// read ~0.5 GB instead of ~11 GB. num_threads_to_upload parallelizes the upload.
+	toml := fmt.Sprintf(
+		"model_cache_key = \"%s_%s\"\n"+
+			"serialization_dir = \"%s\"\n"+
+			"serialize_program_cache = true\n"+
+			"serialize_external_tensors = true\n"+
+			"enable_constant_tensors_sharing = true\n"+
+			"num_threads_to_upload = 2\n",
 		modelKey, tag, filepath.ToSlash(dir))
 	if err := opts.AddOpaqueOption("gpu_options", toml); err != nil {
 		opts.Close()
