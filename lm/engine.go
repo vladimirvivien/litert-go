@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -71,6 +72,7 @@ type Engine struct {
 	tok        tokenizer
 	md         litertlm.Metadata
 	fileBytes  []byte
+	modelKey   string // per-model GPU program-cache namespace
 	pre        prefiller
 	decode     sig
 	verify     sig
@@ -83,6 +85,73 @@ type Engine struct {
 	lastText   string          // most recent streamed output (GenerateStream/SendStream)
 }
 
+// envOptions builds the LiteRt environment options: the runtime-library
+// directory, so accelerator plugins (e.g. libLiteRtWebGpuAccelerator) resolve
+// from libDir without having to be on the OS search path.
+func envOptions(libDir string) []litert.EnvOption {
+	if libDir == "" {
+		libDir = os.Getenv("LITERT_LIB")
+	}
+	if libDir == "" {
+		return nil
+	}
+	if fi, err := os.Stat(libDir); err == nil && !fi.IsDir() {
+		libDir = filepath.Dir(libDir)
+	}
+	return []litert.EnvOption{{Tag: litert.EnvRuntimeLibraryDir, Str: libDir}}
+}
+
+// modelCacheKey is a namespace for a model's serialized GPU programs, unique to
+// the file's identity (path, size, mtime) so a changed model does not reuse a
+// stale cache.
+func modelCacheKey(modelPath string) string {
+	key := filepath.Base(modelPath)
+	if fi, err := os.Stat(modelPath); err == nil {
+		key = fmt.Sprintf("%s_%d_%d", key, fi.Size(), fi.ModTime().UnixNano())
+	}
+	return key
+}
+
+// gpuCacheDir is a writable directory for persisting compiled GPU programs
+// across runs.
+func gpuCacheDir() string {
+	base, err := os.UserCacheDir()
+	if err != nil {
+		base = os.TempDir()
+	}
+	return filepath.Join(base, "litert-go", "gpu-cache")
+}
+
+// gpuCompileOptions builds compilation options for accel. On GPU it attaches the
+// "gpu_options" payload that persists compiled WebGPU programs to gpuCacheDir
+// under modelKey+tag, so a warm run skips kernel recompilation. tag distinguishes
+// the graphs compiled from one model (main decode, embedders, vision, audio) so
+// their caches do not collide.
+func gpuCompileOptions(accel litert.HwAccelerator, modelKey, tag string) (litert.Options, error) {
+	opts, err := litert.NewOptions(accel)
+	if err != nil {
+		return 0, err
+	}
+	if accel != litert.AccelGPU {
+		return opts, nil
+	}
+	dir := gpuCacheDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return opts, nil
+	}
+	toml := fmt.Sprintf("model_cache_key = \"%s_%s\"\nserialization_dir = \"%s\"\nserialize_program_cache = true\n",
+		modelKey, tag, filepath.ToSlash(dir))
+	if err := opts.AddOpaqueOption("gpu_options", toml); err != nil {
+		opts.Close()
+		return 0, err
+	}
+	return opts, nil
+}
+
+func (e *Engine) compileOptions(tag string) (litert.Options, error) {
+	return gpuCompileOptions(e.accel, e.modelKey, tag)
+}
+
 // Open loads libLiteRt from libDir (or the LITERT_LIB environment variable),
 // reads the .litertlm or .tflite model at modelPath, extracts its main
 // generation graph, tokenizer, and metadata, and compiles it for accel. Close
@@ -91,7 +160,8 @@ func Open(libDir, modelPath string, accel litert.HwAccelerator) (*Engine, error)
 	if err := litert.Load(libDir); err != nil {
 		return nil, err
 	}
-	env, err := litert.NewEnvironment()
+	opts := envOptions(libDir)
+	env, err := litert.NewEnvironment(opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -106,6 +176,7 @@ func Open(libDir, modelPath string, accel litert.HwAccelerator) (*Engine, error)
 	if e.fileBytes, err = os.ReadFile(modelPath); err != nil {
 		return nil, err
 	}
+	e.modelKey = modelCacheKey(modelPath)
 	tflite := e.fileBytes
 	if litertlm.IsContainer(e.fileBytes) {
 		if tflite, err = litertlm.SectionTFLite(e.fileBytes); err != nil {
@@ -161,7 +232,7 @@ func Open(libDir, modelPath string, accel litert.HwAccelerator) (*Engine, error)
 	}
 	e.pre.sortSizes()
 
-	if e.opts, err = litert.NewOptions(accel); err != nil {
+	if e.opts, err = e.compileOptions("main"); err != nil {
 		return nil, err
 	}
 	if e.cm, err = litert.Compile(env, e.model, e.opts); err != nil {
@@ -212,7 +283,7 @@ func (e *Engine) ensureEmbedders() (*embedModel, *embedModel, error) {
 	if e.emb != nil {
 		return e.emb, e.ple, nil
 	}
-	opts, err := litert.NewOptions(e.accel)
+	opts, err := e.compileOptions("embed")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -338,7 +409,7 @@ func (e *Engine) generate(prompt []int32, o GenOptions, onToken func(int32)) ([]
 		if err != nil {
 			return nil, err
 		}
-		return decodeSpeculative(e.env, e.cm, e.fileBytes, e.pre, e.decode, e.verify, emb, ple, prompt, o.MaxTokens, stop, e.accel, onToken)
+		return decodeSpeculative(e.env, e.cm, e.fileBytes, e.pre, e.decode, e.verify, emb, ple, prompt, o.MaxTokens, stop, e.accel, e.modelKey, onToken)
 	case sigHasInput(e.decode, "embeddings"):
 		emb, ple, err := e.ensureEmbedders()
 		if err != nil {

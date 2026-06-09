@@ -30,6 +30,22 @@ var (
 		"LiteRtDestroyOptions",
 		&ffi.TypeVoid, &ffi.TypePointer)
 
+	// ---- Opaque (accelerator) options ----
+	createOpaqueOptionsFunc = newLazyFun(
+		"LiteRtCreateOpaqueOptions",
+		&ffi.TypeSint32,
+		&ffi.TypePointer, // const char* payload_identifier
+		&ffi.TypePointer, // void* payload_data
+		&ffi.TypePointer, // void (*payload_destructor)(void*)
+		&ffi.TypePointer, // LiteRtOpaqueOptions* options
+	)
+	addOpaqueOptionsFunc = newLazyFun(
+		"LiteRtAddOpaqueOptions",
+		&ffi.TypeSint32,
+		&ffi.TypePointer, // LiteRtOptions options
+		&ffi.TypePointer, // LiteRtOpaqueOptions opaque_options
+	)
+
 	// ---- Model load ----
 	createModelFromFileFunc = newLazyFun(
 		"LiteRtCreateModelFromFile",

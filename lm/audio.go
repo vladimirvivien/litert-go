@@ -31,7 +31,7 @@ func (e *Engine) ensureAudio() (*audioPipeline, error) {
 	if err != nil {
 		return nil, fmt.Errorf("audio adapter section: %w", err)
 	}
-	opts, err := litert.NewOptions(e.accel)
+	opts, err := e.compileOptions("audio")
 	if err != nil {
 		return nil, err
 	}

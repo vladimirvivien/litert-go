@@ -139,22 +139,60 @@ func (tt TensorType) raw() []byte {
 // argument the C side reads or writes through needs a second level: a pinned
 // holder hp whose value is &slot, passed as unsafe.Pointer(&hp). See ffi.go.
 
-// NewEnvironment creates a default LiteRt environment.
-func NewEnvironment() (Environment, error) {
+// EnvOptionTag identifies a LiteRtEnvironment string option.
+type EnvOptionTag int32
+
+const (
+	// EnvRuntimeLibraryDir is where the runtime looks for accelerator plugins
+	// (e.g. libLiteRtWebGpuAccelerator), so they need not be on the OS path.
+	EnvRuntimeLibraryDir EnvOptionTag = 22
+)
+
+// EnvOption is a string-valued LiteRtEnvironment option.
+type EnvOption struct {
+	Tag EnvOptionTag
+	Str string
+}
+
+// envOptRetain keeps the option strings/buffers alive for the process: LiteRT
+// references the option strings beyond the create call (until model init).
+var envOptRetain [][]byte
+
+// NewEnvironment creates a LiteRt environment with the given options.
+func NewEnvironment(opts ...EnvOption) (Environment, error) {
 	var pin runtime.Pinner
 	defer pin.Unpin()
 
-	numOpts := int32(0)
-	pin.Pin(&numOpts)
-	var opts uintptr // null options pointer, passed by value (0)
-	pin.Pin(&opts)
 	var env uintptr
 	pin.Pin(&env)
 	envp := unsafe.Pointer(&env)
 	pin.Pin(&envp)
+	numOpts := int32(len(opts))
+	pin.Pin(&numOpts)
+
+	// LiteRtEnvOption is 24 bytes: tag (int32) @0, LiteRtAny value @8 whose type
+	// (int32) is @8 and string pointer @16.
+	const optSize, anyTypeString = 24, int32(8)
+	var optsPtr unsafe.Pointer
+	if len(opts) > 0 {
+		buf := make([]byte, len(opts)*optSize)
+		for i, o := range opts {
+			cs := cbytes(o.Str)
+			envOptRetain = append(envOptRetain, cs)
+			pin.Pin(&cs[0])
+			base := i * optSize
+			*(*int32)(unsafe.Pointer(&buf[base])) = int32(o.Tag)
+			*(*int32)(unsafe.Pointer(&buf[base+8])) = anyTypeString
+			*(*uintptr)(unsafe.Pointer(&buf[base+16])) = uintptr(unsafe.Pointer(&cs[0]))
+		}
+		envOptRetain = append(envOptRetain, buf)
+		pin.Pin(&buf[0])
+		optsPtr = unsafe.Pointer(&buf[0])
+	}
+	pin.Pin(&optsPtr)
 
 	st := invoke(&pin, createEnvironmentFunc,
-		unsafe.Pointer(&numOpts), unsafe.Pointer(&opts), unsafe.Pointer(&envp))
+		unsafe.Pointer(&numOpts), unsafe.Pointer(&optsPtr), unsafe.Pointer(&envp))
 	return Environment(env), st.err("LiteRtCreateEnvironment")
 }
 

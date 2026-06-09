@@ -217,8 +217,8 @@ func elemCount(g sig, name string, out bool) int {
 
 // decodeSpeculative runs MTP speculative decoding on an embedding-input model
 // that has a verify signature and an mtp_drafter section.
-func decodeSpeculative(env litert.Environment, cm litert.CompiledModel, fileBytes []byte, pre prefiller, decode, verifySig sig, emb, ple *embedModel, prompt []int32, ngen int, stop map[int32]bool, accel litert.HwAccelerator, onToken func(int32)) ([]int, error) {
-	opts, err := litert.NewOptions(accel)
+func decodeSpeculative(env litert.Environment, cm litert.CompiledModel, fileBytes []byte, pre prefiller, decode, verifySig sig, emb, ple *embedModel, prompt []int32, ngen int, stop map[int32]bool, accel litert.HwAccelerator, modelKey string, onToken func(int32)) ([]int, error) {
+	opts, err := gpuCompileOptions(accel, modelKey, "spec")
 	if err != nil {
 		return nil, err
 	}

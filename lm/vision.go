@@ -37,7 +37,7 @@ func (e *Engine) ensureVision() (*visionPipeline, error) {
 	if err != nil {
 		return nil, fmt.Errorf("vision adapter section: %w", err)
 	}
-	opts, err := litert.NewOptions(e.accel)
+	opts, err := e.compileOptions("vision")
 	if err != nil {
 		return nil, err
 	}
