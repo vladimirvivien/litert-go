@@ -131,6 +131,17 @@ var (
 		&ffi.TypeUint64,  // num_output_buffers
 		&ffi.TypePointer, // LiteRtTensorBuffer* output_buffers
 	)
+	runCompiledModelAsyncFunc = newLazyFun(
+		"LiteRtRunCompiledModelAsync",
+		&ffi.TypeSint32,
+		&ffi.TypePointer, // LiteRtCompiledModel
+		&ffi.TypeUint64,  // signature_index
+		&ffi.TypeUint64,  // num_input_buffers
+		&ffi.TypePointer, // LiteRtTensorBuffer* input_buffers
+		&ffi.TypeUint64,  // num_output_buffers
+		&ffi.TypePointer, // LiteRtTensorBuffer* output_buffers
+		&ffi.TypePointer, // bool* async
+	)
 	destroyCompiledModelFunc = newLazyFun(
 		"LiteRtDestroyCompiledModel",
 		&ffi.TypeVoid, &ffi.TypePointer)
@@ -154,6 +165,18 @@ var (
 	destroyTensorBufferFunc = newLazyFun(
 		"LiteRtDestroyTensorBuffer",
 		&ffi.TypeVoid, &ffi.TypePointer)
+	hasTensorBufferEventFunc = newLazyFun(
+		"LiteRtHasTensorBufferEvent",
+		&ffi.TypeSint32, &ffi.TypePointer, &ffi.TypePointer)
+	getTensorBufferEventFunc = newLazyFun(
+		"LiteRtGetTensorBufferEvent",
+		&ffi.TypeSint32, &ffi.TypePointer, &ffi.TypePointer)
+	waitEventFunc = newLazyFun(
+		"LiteRtWaitEvent",
+		&ffi.TypeSint32, &ffi.TypePointer, &ffi.TypeSint64)
+	clearTensorBufferEventFunc = newLazyFun(
+		"LiteRtClearTensorBufferEvent",
+		&ffi.TypeSint32, &ffi.TypePointer)
 
 	// ---- Tensor buffer requirements ----
 	getTensorBufferRequirementsBufferSizeFunc = newLazyFun(

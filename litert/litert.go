@@ -734,6 +734,65 @@ func (b TensorBuffer) Close() {
 	destroyTensorBufferFunc.Call(nil, unsafe.Pointer(&h))
 }
 
+// HasEvent reports whether an asynchronous run attached a synchronization
+// event to the buffer.
+func (b TensorBuffer) HasEvent() (bool, error) {
+	var pin runtime.Pinner
+	defer pin.Unpin()
+
+	h := uintptr(b)
+	pin.Pin(&h)
+	var has byte
+	pin.Pin(&has)
+	hasp := unsafe.Pointer(&has)
+	pin.Pin(&hasp)
+	st := invoke(&pin, hasTensorBufferEventFunc, unsafe.Pointer(&h), unsafe.Pointer(&hasp))
+	return has != 0, st.err("LiteRtHasTensorBufferEvent")
+}
+
+// ClearEvent detaches the synchronization event an asynchronous run attached
+// to the buffer, without waiting on it.
+func (b TensorBuffer) ClearEvent() error {
+	var pin runtime.Pinner
+	defer pin.Unpin()
+	h := uintptr(b)
+	pin.Pin(&h)
+	return invoke(&pin, clearTensorBufferEventFunc, unsafe.Pointer(&h)).err("LiteRtClearTensorBufferEvent")
+}
+
+// Wait blocks until the synchronization event an asynchronous run attached to
+// the buffer signals, and returns immediately when no event is attached.
+// Locking the buffer also waits; Wait synchronizes without mapping the buffer
+// to host memory.
+func (b TensorBuffer) Wait() error {
+	has, err := b.HasEvent()
+	if err != nil || !has {
+		return err
+	}
+
+	var pin runtime.Pinner
+	defer pin.Unpin()
+
+	h := uintptr(b)
+	pin.Pin(&h)
+
+	var ev uintptr
+	pin.Pin(&ev)
+	evp := unsafe.Pointer(&ev)
+	pin.Pin(&evp)
+	st := invoke(&pin, getTensorBufferEventFunc, unsafe.Pointer(&h), unsafe.Pointer(&evp))
+	if err := st.err("LiteRtGetTensorBufferEvent"); err != nil {
+		return err
+	}
+	if ev == 0 {
+		return nil
+	}
+	timeout := int64(-1)
+	pin.Pin(&timeout)
+	st = invoke(&pin, waitEventFunc, unsafe.Pointer(&ev), unsafe.Pointer(&timeout))
+	return st.err("LiteRtWaitEvent")
+}
+
 // Run invokes the signature at sig with the given input and output buffers.
 func (c CompiledModel) Run(sig int, inputs, outputs []TensorBuffer) error {
 	var pin runtime.Pinner

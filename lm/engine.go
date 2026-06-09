@@ -297,7 +297,11 @@ func (e *Engine) ensureEmbedders() (*embedModel, *embedModel, error) {
 	if e.emb != nil {
 		return e.emb, e.ple, nil
 	}
-	opts, err := e.compileOptions("embed")
+	// Embedders compile on CPU regardless of the engine accelerator, matching
+	// the C++ engine (EmbeddingLookupText::Initialize). An embedding lookup is a
+	// gather; running it on GPU buys nothing and forces the embedding table into
+	// GPU memory and the GPU weight cache.
+	opts, err := litert.NewOptions(litert.AccelCPU)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1050,14 +1054,15 @@ func prefillStep(env litert.Environment, cm litert.CompiledModel, g sig, kv map[
 // KV buffers persist across steps (single-bank cache) and logits is overwritten
 // by each Run.
 type decoder struct {
-	tokens litert.TensorBuffer
-	posBuf litert.TensorBuffer
-	mask   litert.TensorBuffer
-	logits litert.TensorBuffer
-	runner *litert.Runner
-	ctx    int
-	vocab  int
-	smp    *sampler
+	tokens  litert.TensorBuffer
+	posBuf  litert.TensorBuffer
+	mask    litert.TensorBuffer
+	logits  litert.TensorBuffer
+	runner  *litert.Runner
+	ctx     int
+	vocab   int
+	smp     *sampler
+	pending bool // an async run was submitted and not yet awaited
 }
 
 func newDecoder(env litert.Environment, cm litert.CompiledModel, g sig, kv map[string]litert.TensorBuffer, smp *sampler) (*decoder, error) {
@@ -1105,8 +1110,18 @@ func newDecoder(env litert.Environment, cm litert.CompiledModel, g sig, kv map[s
 }
 
 // feed writes one token at pos and runs the model, leaving logits in d.logits.
-// It does not sample — used to ingest known tokens into the KV cache.
+// It does not sample — used to ingest known tokens into the KV cache. The run
+// is submitted asynchronously when the backend supports it; sampling (or the
+// next feed) waits for completion through the logits buffer's event. Input
+// buffers must not be rewritten while a submitted run is in flight, so feed
+// awaits any pending run before writing.
 func (d *decoder) feed(token int32, pos int) error {
+	if d.pending {
+		if err := d.logits.Wait(); err != nil {
+			return err
+		}
+		d.pending = false
+	}
 	if err := writeInts(d.tokens, []int32{token}); err != nil {
 		return err
 	}
@@ -1116,11 +1131,20 @@ func (d *decoder) feed(token int32, pos int) error {
 	if err := fillCausalMask(d.mask, 1, d.ctx, pos); err != nil {
 		return err
 	}
-	return d.runner.Run()
+	async, err := d.runner.RunAsync()
+	if err != nil {
+		return err
+	}
+	d.pending = async
+	return nil
 }
 
-// sample picks the next token from the logits of the most recent feed.
-func (d *decoder) sample() (int32, error) { return d.smp.sample(d.logits, d.vocab) }
+// sample picks the next token from the logits of the most recent feed. Locking
+// the logits buffer waits out any in-flight async run.
+func (d *decoder) sample() (int32, error) {
+	d.pending = false
+	return d.smp.sample(d.logits, d.vocab)
+}
 
 func (d *decoder) step(token int32, pos int) (int32, error) {
 	if err := d.feed(token, pos); err != nil {

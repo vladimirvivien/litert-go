@@ -25,6 +25,8 @@ type Runner struct {
 	outArr []uintptr
 	inp    unsafe.Pointer
 	outp   unsafe.Pointer
+	async  byte
+	asyncP unsafe.Pointer
 	pin    runtime.Pinner
 }
 
@@ -42,6 +44,7 @@ func NewRunner(cm CompiledModel, sig int, inputs, outputs []TensorBuffer) *Runne
 	}
 	r.inp = unsafe.Pointer(&r.inArr[0])
 	r.outp = unsafe.Pointer(&r.outArr[0])
+	r.asyncP = unsafe.Pointer(&r.async)
 
 	r.pin.Pin(&r.st)
 	r.pin.Pin(&r.cm)
@@ -52,6 +55,8 @@ func NewRunner(cm CompiledModel, sig int, inputs, outputs []TensorBuffer) *Runne
 	r.pin.Pin(&r.inp)
 	r.pin.Pin(&r.outArr[0])
 	r.pin.Pin(&r.outp)
+	r.pin.Pin(&r.async)
+	r.pin.Pin(&r.asyncP)
 	return r
 }
 
@@ -63,6 +68,32 @@ func (r *Runner) Run() error {
 		unsafe.Pointer(&r.nin), unsafe.Pointer(&r.inp),
 		unsafe.Pointer(&r.nout), unsafe.Pointer(&r.outp))
 	return Status(r.st).err("LiteRtRunCompiledModel")
+}
+
+// RunAsync invokes the bound signature asynchronously when the backend
+// supports it, falling back to a synchronous run otherwise; the returned bool
+// reports which happened. Under asynchronous execution the output buffers
+// carry synchronization events: locking an output (or TensorBuffer.Wait)
+// blocks until the producing work finishes. Do not rewrite the input buffers
+// until the submitted run has been awaited through one of its outputs.
+//
+// Output-buffer events are assigned by the runtime, and a submission is
+// rejected when an output still carries one, so RunAsync detaches stale events
+// from the bound outputs left by the previous submission. Device-side ordering
+// is unaffected: runs on one accelerator queue execute in submission order.
+func (r *Runner) RunAsync() (bool, error) {
+	for _, h := range r.outArr {
+		if err := TensorBuffer(h).ClearEvent(); err != nil {
+			return false, err
+		}
+	}
+	r.async = 0
+	runCompiledModelAsyncFunc.Call(&r.st,
+		unsafe.Pointer(&r.cm), unsafe.Pointer(&r.sig),
+		unsafe.Pointer(&r.nin), unsafe.Pointer(&r.inp),
+		unsafe.Pointer(&r.nout), unsafe.Pointer(&r.outp),
+		unsafe.Pointer(&r.asyncP))
+	return r.async != 0, Status(r.st).err("LiteRtRunCompiledModelAsync")
 }
 
 // Close releases the pinned call arguments. It does not close the bound
