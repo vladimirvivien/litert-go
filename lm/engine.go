@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"time"
 	"unsafe"
 
 	sentencepiece "github.com/eliben/go-sentencepiece"
@@ -127,7 +128,15 @@ func gpuCacheDir() string {
 // under modelKey+tag, so a warm run skips kernel recompilation. tag distinguishes
 // the graphs compiled from one model (main decode, embedders, vision, audio) so
 // their caches do not collide.
-func gpuCompileOptions(accel litert.HwAccelerator, modelKey, tag string) (litert.Options, error) {
+//
+// tokenKV marks a graph whose KV cache is driven double-buffered (the
+// token-input decode path). Those graphs keep the kv_cache_ tensors in the
+// delegate's native layout — skipping a per-step layout conversion of every KV
+// tensor — and prepare command buffers two steps ahead, matching the C++
+// engine's decode configuration. The native KV layout requires the two-bank KV
+// scheme: the WebGPU delegate rejects an external buffer serving as both a
+// run's input and its output, so single-bank KV graphs must not set it.
+func gpuCompileOptions(accel litert.HwAccelerator, modelKey, tag string, tokenKV bool) (litert.Options, error) {
 	opts, err := litert.NewOptions(accel)
 	if err != nil {
 		return 0, err
@@ -155,6 +164,10 @@ func gpuCompileOptions(accel litert.HwAccelerator, modelKey, tag string) (litert
 			"enable_constant_tensors_sharing = true\n"+
 			"num_threads_to_upload = 2\n",
 		modelKey, tag, filepath.ToSlash(dir))
+	if tokenKV {
+		toml += "external_tensor_patterns = [\"kv_cache_\"]\n" +
+			"num_steps_of_command_buffer_preparations = 2\n"
+	}
 	if err := opts.AddOpaqueOption("gpu_options", toml); err != nil {
 		opts.Close()
 		return 0, err
@@ -163,7 +176,8 @@ func gpuCompileOptions(accel litert.HwAccelerator, modelKey, tag string) (litert
 }
 
 func (e *Engine) compileOptions(tag string) (litert.Options, error) {
-	return gpuCompileOptions(e.accel, e.modelKey, tag)
+	tokenKV := tag == "main" && !sigHasInput(e.decode, "embeddings")
+	return gpuCompileOptions(e.accel, e.modelKey, tag, tokenKV)
 }
 
 // Open loads libLiteRt from libDir (or the LITERT_LIB environment variable),
@@ -533,7 +547,7 @@ type Session struct {
 	o       GenOptions
 	tpl     litertlm.PromptTemplates
 	stop    map[int32]bool
-	kv      map[string]litert.TensorBuffer
+	kv      *kvBanks
 	dec     *decoder
 	pos     int
 	started bool
@@ -554,7 +568,7 @@ func (e *Engine) NewSession(o GenOptions) (*Session, error) {
 	if !ok {
 		return nil, fmt.Errorf("lm: model has no chat template (model type %q)", e.md.ModelType)
 	}
-	kv, err := allocKV(e.env, e.cm, e.pre.max())
+	kv, err := allocKVBanks(e.env, e.cm, e.pre.max())
 	if err != nil {
 		return nil, err
 	}
@@ -573,8 +587,8 @@ func (s *Session) Close() {
 	if s.dec != nil {
 		s.dec.close()
 	}
-	for _, b := range s.kv {
-		b.Close()
+	if s.kv != nil {
+		s.kv.close()
 	}
 }
 
@@ -800,9 +814,50 @@ func allocKV(env litert.Environment, cm litert.CompiledModel, g sig) (map[string
 	return kv, nil
 }
 
+// kvBanks is a double-buffered KV cache. Each Run reads one bank and writes the
+// full updated cache to the other, then the banks swap. Alternating banks lets
+// the GPU delegate reuse pre-prepared command buffers across steps (resource
+// bindings repeat with period two) instead of re-encoding every dispatch, and
+// keeps each Run's KV reads and writes on distinct buffers.
+type kvBanks struct {
+	a, b map[string]litert.TensorBuffer
+	bIn  bool // false: a is the current (valid) input bank; true: b is
+}
+
+// allocKVBanks allocates both KV banks from g's buffer requirements.
+func allocKVBanks(env litert.Environment, cm litert.CompiledModel, g sig) (*kvBanks, error) {
+	a, err := allocKV(env, cm, g)
+	if err != nil {
+		return nil, err
+	}
+	b, err := allocKV(env, cm, g)
+	if err != nil {
+		closeBufs(a)
+		return nil, err
+	}
+	return &kvBanks{a: a, b: b}, nil
+}
+
+func (k *kvBanks) in() map[string]litert.TensorBuffer {
+	if k.bIn {
+		return k.b
+	}
+	return k.a
+}
+
+func (k *kvBanks) out() map[string]litert.TensorBuffer {
+	if k.bIn {
+		return k.a
+	}
+	return k.b
+}
+
+func (k *kvBanks) swap()  { k.bIn = !k.bIn }
+func (k *kvBanks) close() { closeBufs(k.a); closeBufs(k.b) }
+
 // prefillTokenRun ingests ids into the KV cache starting at position start,
 // chunking across prefill buckets for prompts longer than one bucket.
-func prefillTokenRun(env litert.Environment, cm litert.CompiledModel, pre prefiller, kv map[string]litert.TensorBuffer, ids []int32, start int) error {
+func prefillTokenRun(env litert.Environment, cm litert.CompiledModel, pre prefiller, kv *kvBanks, ids []int32, start int) error {
 	off := 0
 	for _, c := range pre.plan(len(ids)) {
 		if err := prefillStep(env, cm, pre.sig[c.bucket], kv, ids[off:off+c.take], start+off); err != nil {
@@ -953,15 +1008,11 @@ func stopSet(tok tokenizer, md litertlm.Metadata) map[int32]bool {
 // allocate the KV cache once, prefill all but the last prompt token, then
 // decode from the held-back token.
 func decodeTokenInput(env litert.Environment, cm litert.CompiledModel, pre prefiller, decode sig, prompt []int32, ngen int, stop map[int32]bool, smp *sampler, onToken func(int32)) ([]int, error) {
-	kv, err := allocKV(env, cm, pre.max())
+	kv, err := allocKVBanks(env, cm, pre.max())
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		for _, b := range kv {
-			b.Close()
-		}
-	}()
+	defer kv.close()
 
 	p := len(prompt) - 1
 	if err := prefillTokenRun(env, cm, pre, kv, prompt[:p], 0); err != nil {
@@ -977,6 +1028,7 @@ func decodeTokenInput(env litert.Environment, cm litert.CompiledModel, pre prefi
 	next := prompt[p]
 	pos := p
 	var gen []int
+	t0 := time.Now()
 	for g := 0; g < ngen; g++ {
 		id, err := dec.step(next, pos)
 		if err != nil {
@@ -992,6 +1044,12 @@ func decodeTokenInput(env litert.Environment, cm litert.CompiledModel, pre prefi
 		next = id
 		pos++
 	}
+	if os.Getenv("LITERT_DECODE_STATS") != "" && len(gen) > 0 {
+		el := time.Since(t0)
+		fmt.Fprintf(os.Stderr, "decode: %d tokens in %v (%.1f ms/token, %.1f tok/s)\n",
+			len(gen), el.Round(time.Millisecond), float64(el.Milliseconds())/float64(len(gen)),
+			float64(len(gen))/el.Seconds())
+	}
 	return gen, nil
 }
 
@@ -1000,7 +1058,7 @@ func decodeTokenInput(env litert.Environment, cm litert.CompiledModel, pre prefi
 // and a causal mask lets row r attend [0, start+r+1) so earlier chunks stay
 // visible. Bucket slots past len(ids) hold padding whose KV is later overwritten
 // or never attended.
-func prefillStep(env litert.Environment, cm litert.CompiledModel, g sig, kv map[string]litert.TensorBuffer, ids []int32, start int) error {
+func prefillStep(env litert.Environment, cm litert.CompiledModel, g sig, kv *kvBanks, ids []int32, start int) error {
 	tokens, err := allocReqInput(env, cm, g, tokenInput(g))
 	if err != nil {
 		return err
@@ -1034,8 +1092,8 @@ func prefillStep(env litert.Environment, cm litert.CompiledModel, g sig, kv map[
 	}
 
 	perCall := map[string]litert.TensorBuffer{tokenInput(g): tokens, "input_pos": pos, "mask": mask}
-	in := assemble(g.inNames, perCall, kv)
-	out := assemble(g.outNames, nil, kv) // prefill outputs are all KV
+	in := assemble(g.inNames, perCall, kv.in())
+	out := assemble(g.outNames, nil, kv.out()) // prefill outputs are all KV
 	for i, b := range in {
 		if b == 0 {
 			return fmt.Errorf("unmapped input[%d] %q", i, g.inNames[i])
@@ -1046,27 +1104,33 @@ func prefillStep(env litert.Environment, cm litert.CompiledModel, g sig, kv map[
 			return fmt.Errorf("unmapped output[%d] %q", i, g.outNames[i])
 		}
 	}
-	return cm.Run(g.idx, in, out)
+	if err := cm.Run(g.idx, in, out); err != nil {
+		return err
+	}
+	kv.swap()
+	return nil
 }
 
-// decoder holds the fixed decode buffer set and a litert.Runner whose Run
-// arguments are pinned once. tokens/input_pos/mask are rewritten each step; the
-// KV buffers persist across steps (single-bank cache) and logits is overwritten
-// by each Run.
+// decoder holds the fixed decode buffer set and a pair of litert.Runners whose
+// Run arguments are pinned once. tokens/input_pos/mask/logits are shared; the
+// two runners differ only in which KV bank they read vs write (runA reads bank
+// a and writes bank b; runB the reverse). Each step uses the runner whose input
+// is the cache's current bank, then the banks swap.
 type decoder struct {
-	tokens  litert.TensorBuffer
-	posBuf  litert.TensorBuffer
-	mask    litert.TensorBuffer
-	logits  litert.TensorBuffer
-	runner  *litert.Runner
-	ctx     int
-	vocab   int
-	smp     *sampler
-	pending bool // an async run was submitted and not yet awaited
+	tokens     litert.TensorBuffer
+	posBuf     litert.TensorBuffer
+	mask       litert.TensorBuffer
+	logits     litert.TensorBuffer
+	runA, runB *litert.Runner
+	kv         *kvBanks
+	ctx        int
+	vocab      int
+	smp        *sampler
+	pending    bool // an async run was submitted and not yet awaited
 }
 
-func newDecoder(env litert.Environment, cm litert.CompiledModel, g sig, kv map[string]litert.TensorBuffer, smp *sampler) (*decoder, error) {
-	d := &decoder{smp: smp}
+func newDecoder(env litert.Environment, cm litert.CompiledModel, g sig, kv *kvBanks, smp *sampler) (*decoder, error) {
+	d := &decoder{smp: smp, kv: kv}
 	var err error
 	if d.tokens, err = allocReqInput(env, cm, g, tokenInput(g)); err != nil {
 		return nil, err
@@ -1093,19 +1157,28 @@ func newDecoder(env litert.Environment, cm litert.CompiledModel, g sig, kv map[s
 	}
 
 	perCall := map[string]litert.TensorBuffer{tokenInput(g): d.tokens, "input_pos": d.posBuf, "mask": d.mask}
-	in := assemble(g.inNames, perCall, kv)
-	out := assemble(g.outNames, map[string]litert.TensorBuffer{"logits": d.logits}, kv)
-	for i, b := range in {
-		if b == 0 {
-			return nil, fmt.Errorf("unmapped input[%d] %q", i, g.inNames[i])
+	logitsOut := map[string]litert.TensorBuffer{"logits": d.logits}
+	runner := func(in, out map[string]litert.TensorBuffer) (*litert.Runner, error) {
+		inB := assemble(g.inNames, perCall, in)
+		outB := assemble(g.outNames, logitsOut, out)
+		for i, b := range inB {
+			if b == 0 {
+				return nil, fmt.Errorf("unmapped input[%d] %q", i, g.inNames[i])
+			}
 		}
-	}
-	for i, b := range out {
-		if b == 0 {
-			return nil, fmt.Errorf("unmapped output[%d] %q", i, g.outNames[i])
+		for i, b := range outB {
+			if b == 0 {
+				return nil, fmt.Errorf("unmapped output[%d] %q", i, g.outNames[i])
+			}
 		}
+		return litert.NewRunner(cm, g.idx, inB, outB), nil
 	}
-	d.runner = litert.NewRunner(cm, g.idx, in, out)
+	if d.runA, err = runner(kv.a, kv.b); err != nil {
+		return nil, err
+	}
+	if d.runB, err = runner(kv.b, kv.a); err != nil {
+		return nil, err
+	}
 	return d, nil
 }
 
@@ -1131,10 +1204,15 @@ func (d *decoder) feed(token int32, pos int) error {
 	if err := fillCausalMask(d.mask, 1, d.ctx, pos); err != nil {
 		return err
 	}
-	async, err := d.runner.RunAsync()
+	run := d.runA // reads bank a
+	if d.kv.bIn {
+		run = d.runB // reads bank b
+	}
+	async, err := run.RunAsync()
 	if err != nil {
 		return err
 	}
+	d.kv.swap()
 	d.pending = async
 	return nil
 }
@@ -1154,7 +1232,8 @@ func (d *decoder) step(token int32, pos int) (int32, error) {
 }
 
 func (d *decoder) close() {
-	d.runner.Close()
+	d.runA.Close()
+	d.runB.Close()
 	d.logits.Close()
 	d.mask.Close()
 	d.posBuf.Close()
