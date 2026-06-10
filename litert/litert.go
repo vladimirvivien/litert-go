@@ -4,7 +4,10 @@ import (
 	"encoding/binary"
 	"fmt"
 	"runtime"
+	"sync"
 	"unsafe"
+
+	"github.com/jupiterrider/ffi"
 )
 
 // Status is a LiteRtStatus code.
@@ -277,12 +280,22 @@ func OpenModel(env Environment, path string) (Model, error) {
 	return Model(m), st.err("LiteRtCreateModelFromFile")
 }
 
+// modelBufferTakesEnv reports whether the loaded runtime's
+// LiteRtCreateModelFromBuffer takes a leading LiteRtEnvironment. The 2.1.5
+// prebuilt does not; later runtimes do. LiteRtCreateModelFromFd shipped in the
+// same API change, so its presence selects the variant.
+var modelBufferTakesEnv = sync.OnceValue(func() bool {
+	_, err := prepSymbol("LiteRtCreateModelFromFd", &ffi.TypeSint32,
+		&ffi.TypePointer, &ffi.TypeSint32, &ffi.TypePointer)
+	return err == nil
+})
+
 // OpenModelFromBuffer loads a .tflite model from memory. The LiteRT C API keeps
 // a reference to the buffer for the model's lifetime, so the caller must keep
-// data alive until the returned Model is closed. The env argument is accepted for
-// API symmetry; LiteRT 2.1.5's LiteRtCreateModelFromBuffer does not take it.
+// data alive until the returned Model is closed. The env argument is passed to
+// runtimes whose LiteRtCreateModelFromBuffer takes it (post-2.1.5) and ignored
+// otherwise.
 func OpenModelFromBuffer(env Environment, data []byte) (Model, error) {
-	_ = env
 	if len(data) == 0 {
 		return 0, fmt.Errorf("litert: empty model buffer")
 	}
@@ -299,8 +312,16 @@ func OpenModelFromBuffer(env Environment, data []byte) (Model, error) {
 	mp := unsafe.Pointer(&m)
 	pin.Pin(&mp)
 
-	st := invoke(&pin, createModelFromBufferFunc,
-		unsafe.Pointer(&datap), unsafe.Pointer(&n), unsafe.Pointer(&mp))
+	var st Status
+	if modelBufferTakesEnv() {
+		e := uintptr(env)
+		pin.Pin(&e)
+		st = invoke(&pin, createModelFromBufferEnvFunc,
+			unsafe.Pointer(&e), unsafe.Pointer(&datap), unsafe.Pointer(&n), unsafe.Pointer(&mp))
+	} else {
+		st = invoke(&pin, createModelFromBufferFunc,
+			unsafe.Pointer(&datap), unsafe.Pointer(&n), unsafe.Pointer(&mp))
+	}
 	return Model(m), st.err("LiteRtCreateModelFromBuffer")
 }
 
@@ -752,6 +773,18 @@ func (b TensorBuffer) HasEvent() (bool, error) {
 
 // ClearEvent detaches the synchronization event an asynchronous run attached
 // to the buffer, without waiting on it.
+// Clear zeroes the buffer's contents through the runtime, which handles every
+// buffer type (host, device, delegate-managed external). Locking and zeroing
+// by hand over-runs delegate-managed buffers whose mapped window is smaller
+// than the requirements size.
+func (b TensorBuffer) Clear() error {
+	var pin runtime.Pinner
+	defer pin.Unpin()
+	h := uintptr(b)
+	pin.Pin(&h)
+	return invoke(&pin, clearTensorBufferDataFunc, unsafe.Pointer(&h)).err("LiteRtClearTensorBuffer")
+}
+
 func (b TensorBuffer) ClearEvent() error {
 	var pin runtime.Pinner
 	defer pin.Unpin()

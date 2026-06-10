@@ -129,14 +129,19 @@ func gpuCacheDir() string {
 // the graphs compiled from one model (main decode, embedders, vision, audio) so
 // their caches do not collide.
 //
-// tokenKV marks a graph whose KV cache is driven double-buffered (the
-// token-input decode path). Those graphs keep the kv_cache_ tensors in the
+// mainKV marks a KV-bearing graph (main model or MTP drafter), whose KV cache
+// is driven double-buffered. Those graphs keep the kv_cache_ tensors in the
 // delegate's native layout — skipping a per-step layout conversion of every KV
-// tensor — and prepare command buffers two steps ahead, matching the C++
-// engine's decode configuration. The native KV layout requires the two-bank KV
-// scheme: the WebGPU delegate rejects an external buffer serving as both a
-// run's input and its output, so single-bank KV graphs must not set it.
-func gpuCompileOptions(accel litert.HwAccelerator, modelKey, tag string, tokenKV bool) (litert.Options, error) {
+// tensor, whose dispatch exceeds the WebGPU 65535-workgroup cap on large
+// models (gemma-4) — and prepare command buffers two steps ahead, matching the
+// C++ engine's configuration (llm_executor_settings_utils.cc). The native KV
+// layout requires the two-bank KV scheme: the WebGPU delegate rejects an
+// external buffer serving as both a run's input and its output.
+//
+// paramTensor marks models with an int32 param_tensor input (MTP models —
+// gemma 4); the C++ engine additionally puts param_tensor in the external set
+// and both patterns in buffer storage.
+func gpuCompileOptions(accel litert.HwAccelerator, modelKey, tag string, mainKV, paramTensor bool) (litert.Options, error) {
 	opts, err := litert.NewOptions(accel)
 	if err != nil {
 		return 0, err
@@ -156,16 +161,25 @@ func gpuCompileOptions(accel litert.HwAccelerator, modelKey, tag string, tokenKV
 	// serialize_external_tensors writes the deduplicated weights to the weight
 	// cache; serialize_program_cache writes the compiled programs. Warm starts then
 	// read ~0.5 GB instead of ~11 GB. num_threads_to_upload parallelizes the upload.
+	// enable_infinite_float_capping clamps infinities under fp16 activations
+	// (the C++ engine sets it for every GPU compile); without it large models
+	// (gemma-4) propagate NaNs into garbage output.
 	toml := fmt.Sprintf(
 		"model_cache_key = \"%s_%s\"\n"+
 			"serialization_dir = \"%s\"\n"+
 			"serialize_program_cache = true\n"+
 			"serialize_external_tensors = true\n"+
 			"enable_constant_tensors_sharing = true\n"+
+			"enable_infinite_float_capping = true\n"+
 			"num_threads_to_upload = 2\n",
 		modelKey, tag, filepath.ToSlash(dir))
-	if tokenKV {
-		toml += "external_tensor_patterns = [\"kv_cache_\"]\n" +
+	if mainKV {
+		ext := "\"kv_cache_\""
+		if paramTensor {
+			ext += ", \"param_tensor\""
+			toml += "buffer_storage_tensor_patterns = [\"kv_cache_\", \"param_tensor\"]\n"
+		}
+		toml += "external_tensor_patterns = [" + ext + "]\n" +
 			"num_steps_of_command_buffer_preparations = 2\n"
 	}
 	if err := opts.AddOpaqueOption("gpu_options", toml); err != nil {
@@ -176,8 +190,14 @@ func gpuCompileOptions(accel litert.HwAccelerator, modelKey, tag string, tokenKV
 }
 
 func (e *Engine) compileOptions(tag string) (litert.Options, error) {
-	tokenKV := tag == "main" && !sigHasInput(e.decode, "embeddings")
-	return gpuCompileOptions(e.accel, e.modelKey, tag, tokenKV)
+	return gpuCompileOptions(e.accel, e.modelKey, tag,
+		tag == "main", sigHasInput(e.decode, "param_tensor"))
+}
+
+// singleKV reports whether the KV cache must run in single-buffer mode (GPU +
+// param_tensor models; see kvBanks).
+func (e *Engine) singleKV() bool {
+	return e.accel == litert.AccelGPU && sigHasInput(e.decode, "param_tensor")
 }
 
 // Open loads libLiteRt from libDir (or the LITERT_LIB environment variable),
@@ -448,7 +468,7 @@ func (e *Engine) generate(prompt []int32, o GenOptions, onToken func(int32)) ([]
 		if err != nil {
 			return nil, err
 		}
-		return decodeEmbeddingInput(e.env, e.cm, e.pre, e.decode, emb, ple, prompt, o.MaxTokens, stop, smp, onToken)
+		return decodeEmbeddingInput(e.env, e.cm, e.pre, e.decode, emb, ple, prompt, o.MaxTokens, stop, smp, e.singleKV(), onToken)
 	default:
 		return decodeTokenInput(e.env, e.cm, e.pre, e.decode, prompt, o.MaxTokens, stop, smp, onToken)
 	}
@@ -569,7 +589,7 @@ func (e *Engine) NewSession(o GenOptions) (*Session, error) {
 	if !ok {
 		return nil, fmt.Errorf("lm: model has no chat template (model type %q)", e.md.ModelType)
 	}
-	kv, err := allocKVBanks(e.env, e.cm, e.pre.max())
+	kv, err := allocKVBanks(e.env, e.cm, e.pre.max(), false)
 	if err != nil {
 		return nil, err
 	}
@@ -618,18 +638,23 @@ func (s *Session) send(userText string, onPiece func(string)) (string, error) {
 		return "", fmt.Errorf("empty turn")
 	}
 
-	// Ingest the turn tokens; the last one's logits start the reply.
-	pos := s.pos
-	for _, id := range ids {
-		if err := s.dec.feed(id, pos); err != nil {
+	// Ingest all but the turn's last token through the prefill graphs at the
+	// session position — the prefill-then-decode sequencing Generate and the
+	// C++ executor use. Do not ingest through consecutive asynchronous decode
+	// runs: the WebGPU delegate corrupts the KV cache under that pattern. The
+	// held-back token's decode logits start the reply.
+	n := len(ids)
+	if n > 1 {
+		if err := prefillTokenRun(s.e.env, s.e.cm, s.e.pre, s.kv, ids[:n-1], s.pos); err != nil {
 			return "", err
 		}
-		pos++
 	}
-	id, err := s.dec.sample()
+	pos := s.pos + n - 1
+	id, err := s.dec.step(ids[n-1], pos)
 	if err != nil {
 		return "", err
 	}
+	pos++
 
 	var stream func(int32)
 	if onPiece != nil {
@@ -820,13 +845,43 @@ func allocKV(env litert.Environment, cm litert.CompiledModel, g sig) (map[string
 // the GPU delegate reuse pre-prepared command buffers across steps (resource
 // bindings repeat with period two) instead of re-encoding every dispatch, and
 // keeps each Run's KV reads and writes on distinct buffers.
+//
+// In single-buffer mode (GPU + param_tensor models — gemma 4) both banks are
+// the same buffer set and swap is a no-op: the delegate's add_values_to_cache
+// kernel scatter-writes only the rows param_tensor names, in place — the graph
+// never emits a full cache copy, so a second bank would lose all prior KV. The
+// aliased in/out binding is legal under the buffer_storage_tensor_patterns the
+// compile sets for these models. This is the C++ executor's
+// gpu_optimized_single_buffer_cache mode.
 type kvBanks struct {
-	a, b map[string]litert.TensorBuffer
-	bIn  bool // false: a is the current (valid) input bank; true: b is
+	a, b   map[string]litert.TensorBuffer
+	bIn    bool // false: a is the current (valid) input bank; true: b is
+	single bool
 }
 
-// allocKVBanks allocates both KV banks from g's buffer requirements.
-func allocKVBanks(env litert.Environment, cm litert.CompiledModel, g sig) (*kvBanks, error) {
+// allocKVBanks allocates the KV cache from g's buffer requirements: one buffer
+// set in single-buffer mode, two banks otherwise. Single-buffer KV is created
+// from the signature's *output* requirements — the input-side requirements for
+// these delegate-managed (external + buffer storage) tensors are unavailable
+// and would fall back to host buffers the delegate's in-place scatter never
+// writes. Matches the C++ executor's CreateOutputBuffer in
+// gpu_optimized_single_buffer_cache mode.
+func allocKVBanks(env litert.Environment, cm litert.CompiledModel, g sig, single bool) (*kvBanks, error) {
+	if single {
+		a := map[string]litert.TensorBuffer{}
+		for _, name := range g.outNames {
+			if !isKV(name) {
+				continue
+			}
+			buf, err := allocReqOutput(env, cm, g, name)
+			if err != nil {
+				closeBufs(a)
+				return nil, fmt.Errorf("alloc %s: %w", name, err)
+			}
+			a[name] = buf
+		}
+		return &kvBanks{a: a, b: a, single: true}, nil
+	}
 	a, err := allocKV(env, cm, g)
 	if err != nil {
 		return nil, err
@@ -853,8 +908,28 @@ func (k *kvBanks) out() map[string]litert.TensorBuffer {
 	return k.b
 }
 
-func (k *kvBanks) swap()  { k.bIn = !k.bIn }
-func (k *kvBanks) close() { closeBufs(k.a); closeBufs(k.b) }
+// inBind returns the bank to bind as run inputs. In single-buffer mode it is
+// nil: the delegate sources the cache from its registered external tensors,
+// and the KV input slots are passed as null handles (the runtime accepts
+// unbound inputs for delegate-managed tensors).
+func (k *kvBanks) inBind() map[string]litert.TensorBuffer {
+	if k.single {
+		return nil
+	}
+	return k.in()
+}
+
+// allowNullIn reports whether a zero handle is acceptable for input name —
+// KV inputs stay unbound in single-buffer mode.
+func (k *kvBanks) allowNullIn(name string) bool { return k.single && isKV(name) }
+
+func (k *kvBanks) swap() { k.bIn = !k.bIn }
+func (k *kvBanks) close() {
+	closeBufs(k.a)
+	if !k.single {
+		closeBufs(k.b)
+	}
+}
 
 // prefillTokenRun ingests ids into the KV cache starting at position start,
 // chunking across prefill buckets for prompts longer than one bucket.
@@ -1009,7 +1084,7 @@ func stopSet(tok tokenizer, md litertlm.Metadata) map[int32]bool {
 // allocate the KV cache once, prefill all but the last prompt token, then
 // decode from the held-back token.
 func decodeTokenInput(env litert.Environment, cm litert.CompiledModel, pre prefiller, decode sig, prompt []int32, ngen int, stop map[int32]bool, smp *sampler, onToken func(int32)) ([]int, error) {
-	kv, err := allocKVBanks(env, cm, pre.max())
+	kv, err := allocKVBanks(env, cm, pre.max(), false)
 	if err != nil {
 		return nil, err
 	}
@@ -1103,6 +1178,13 @@ func prefillStep(env litert.Environment, cm litert.CompiledModel, g sig, kv *kvB
 	for i, b := range out {
 		if b == 0 {
 			return fmt.Errorf("unmapped output[%d] %q", i, g.outNames[i])
+		}
+	}
+	// KV banks carry events from prior asynchronous decode runs (turn 2+ of a
+	// session); the runtime rejects output buffers with attached events.
+	for _, b := range out {
+		if err := b.ClearEvent(); err != nil {
+			return err
 		}
 	}
 	if err := cm.Run(g.idx, in, out); err != nil {
@@ -1283,10 +1365,18 @@ func assemble(names []string, perCall, kv map[string]litert.TensorBuffer) []lite
 	return out
 }
 
+// newZeroedSized allocates a managed buffer and zeroes it. The runtime's
+// Clear handles delegate-managed buffers whose mapped window is smaller than
+// the requirements size (zeroing those by hand faults); buffer types Clear
+// does not support (host memory) are zeroed through Lock, where the mapped
+// window covers the full size.
 func newZeroedSized(env litert.Environment, bt litert.BufferType, tt litert.TensorType, size uint64) (litert.TensorBuffer, error) {
 	buf, err := litert.NewManagedBuffer(env, bt, tt, size)
 	if err != nil {
 		return 0, err
+	}
+	if err := buf.Clear(); err == nil {
+		return buf, nil
 	}
 	addr, err := buf.Lock(litert.LockWrite)
 	if err != nil {

@@ -63,6 +63,18 @@ var (
 		&ffi.TypeUint64,  // size_t buffer_size
 		&ffi.TypePointer, // LiteRtModel* model
 	)
+	// LiteRtCreateModelFromBuffer(env, buffer, size, model*) — post-2.1.5
+	// runtimes add the leading environment. OpenModelFromBuffer selects the
+	// variant by probing LiteRtCreateModelFromFd, which shipped in the same
+	// API change.
+	createModelFromBufferEnvFunc = newLazyFun(
+		"LiteRtCreateModelFromBuffer",
+		&ffi.TypeSint32,
+		&ffi.TypePointer, // LiteRtEnvironment
+		&ffi.TypePointer, // const void* buffer_addr
+		&ffi.TypeUint64,  // size_t buffer_size
+		&ffi.TypePointer, // LiteRtModel* model
+	)
 	destroyModelFunc = newLazyFun(
 		"LiteRtDestroyModel",
 		&ffi.TypeVoid, &ffi.TypePointer)
@@ -165,6 +177,9 @@ var (
 	destroyTensorBufferFunc = newLazyFun(
 		"LiteRtDestroyTensorBuffer",
 		&ffi.TypeVoid, &ffi.TypePointer)
+	clearTensorBufferDataFunc = newLazyFun(
+		"LiteRtClearTensorBuffer",
+		&ffi.TypeSint32, &ffi.TypePointer)
 	hasTensorBufferEventFunc = newLazyFun(
 		"LiteRtHasTensorBufferEvent",
 		&ffi.TypeSint32, &ffi.TypePointer, &ffi.TypePointer)

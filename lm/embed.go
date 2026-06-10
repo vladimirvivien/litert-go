@@ -2,6 +2,8 @@ package lm
 
 import (
 	"fmt"
+	"os"
+	"time"
 	"unsafe"
 
 	"github.com/vladimirvivien/litert-go/litert"
@@ -95,19 +97,15 @@ func (e *embedModel) close() {
 	e.model.Close()
 }
 
-// decodeEmbeddingInput runs the gemma 3n/4 pipeline: allocate the i8 KV cache,
-// prefill all but the last prompt token through the shared embedder stages, then
-// greedily decode from the held-back token.
-func decodeEmbeddingInput(env litert.Environment, cm litert.CompiledModel, pre prefiller, decode sig, emb, ple *embedModel, prompt []int32, ngen int, stop map[int32]bool, smp *sampler, onToken func(int32)) ([]int, error) {
-	kv, err := allocKV(env, cm, pre.max())
+// decodeEmbeddingInput runs the gemma 3n/4 pipeline: allocate the double-banked
+// i8 KV cache, prefill all but the last prompt token through the shared embedder
+// stages, then greedily decode from the held-back token.
+func decodeEmbeddingInput(env litert.Environment, cm litert.CompiledModel, pre prefiller, decode sig, emb, ple *embedModel, prompt []int32, ngen int, stop map[int32]bool, smp *sampler, singleKV bool, onToken func(int32)) ([]int, error) {
+	kv, err := allocKVBanks(env, cm, pre.max(), singleKV)
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		for _, b := range kv {
-			b.Close()
-		}
-	}()
+	defer kv.close()
 
 	p := len(prompt) - 1
 	if err := prefillEmbedRun(env, cm, pre, kv, emb, ple, prompt[:p], 0); err != nil {
@@ -123,6 +121,7 @@ func decodeEmbeddingInput(env litert.Environment, cm litert.CompiledModel, pre p
 	next := prompt[p]
 	pos := p
 	var gen []int
+	t0 := time.Now()
 	for g := 0; g < ngen; g++ {
 		id, err := dec.step(next, pos)
 		if err != nil {
@@ -137,6 +136,12 @@ func decodeEmbeddingInput(env litert.Environment, cm litert.CompiledModel, pre p
 		}
 		next = id
 		pos++
+	}
+	if os.Getenv("LITERT_DECODE_STATS") != "" && len(gen) > 0 {
+		el := time.Since(t0)
+		fmt.Fprintf(os.Stderr, "decode: %d tokens in %v (%.1f ms/token, %.1f tok/s)\n",
+			len(gen), el.Round(time.Millisecond), float64(el.Milliseconds())/float64(len(gen)),
+			float64(len(gen))/el.Seconds())
 	}
 	return gen, nil
 }
@@ -203,7 +208,7 @@ func closeBufs(bufs map[string]litert.TensorBuffer) {
 // attends [0, start+i+1) (so earlier cached turns stay visible), and a
 // param_tensor that begins the KV write at start. With start 0 it is a fresh
 // prefill; with start > 0 it appends a turn to an existing cache.
-func prefillEmbed(env litert.Environment, cm litert.CompiledModel, g sig, kv map[string]litert.TensorBuffer, emb, ple *embedModel, ids []int32, start int) error {
+func prefillEmbed(env litert.Environment, cm litert.CompiledModel, g sig, kv *kvBanks, emb, ple *embedModel, ids []int32, start int) error {
 	text, perLayer, err := embedTokens(emb, ple, ids)
 	if err != nil {
 		return err
@@ -214,7 +219,7 @@ func prefillEmbed(env litert.Environment, cm litert.CompiledModel, g sig, kv map
 // prefillEmbedFill ingests pre-computed text (and per-layer) embeddings for n
 // tokens into the KV cache at position start through bucket g. Used directly by
 // the multimodal path, which splices image embeddings into text before prefill.
-func prefillEmbedFill(env litert.Environment, cm litert.CompiledModel, g sig, kv map[string]litert.TensorBuffer, text, perLayer []float32, n, start int) error {
+func prefillEmbedFill(env litert.Environment, cm litert.CompiledModel, g sig, kv *kvBanks, text, perLayer []float32, n, start int) error {
 	embShape, _ := inputShape(g, "embeddings") // [1, seq, H]
 	seq := int(embShape[1])
 	if n > seq {
@@ -240,19 +245,30 @@ func prefillEmbedFill(env litert.Environment, cm litert.CompiledModel, g sig, kv
 		}
 	}
 
-	in := assemble(g.inNames, bufs, kv)
-	out := assemble(g.outNames, nil, kv)
+	in := assemble(g.inNames, bufs, kv.inBind())
+	out := assemble(g.outNames, nil, kv.out())
 	for i, b := range in {
-		if b == 0 {
+		if b == 0 && !kv.allowNullIn(g.inNames[i]) {
 			return fmt.Errorf("unmapped input[%d] %q", i, g.inNames[i])
 		}
 	}
-	return cm.Run(g.idx, in, out)
+	// KV banks carry events from prior asynchronous decode runs (turn 2+ of a
+	// session); the runtime rejects output buffers with attached events.
+	for _, b := range out {
+		if err := b.ClearEvent(); err != nil {
+			return err
+		}
+	}
+	if err := cm.Run(g.idx, in, out); err != nil {
+		return err
+	}
+	kv.swap()
+	return nil
 }
 
 // prefillEmbedRun ingests ids into the KV cache starting at position start,
 // chunking across prefill buckets for prompts longer than one bucket.
-func prefillEmbedRun(env litert.Environment, cm litert.CompiledModel, pre prefiller, kv map[string]litert.TensorBuffer, emb, ple *embedModel, ids []int32, start int) error {
+func prefillEmbedRun(env litert.Environment, cm litert.CompiledModel, pre prefiller, kv *kvBanks, emb, ple *embedModel, ids []int32, start int) error {
 	off := 0
 	for _, c := range pre.plan(len(ids)) {
 		if err := prefillEmbed(env, cm, pre.sig[c.bucket], kv, emb, ple, ids[off:off+c.take], start+off); err != nil {
@@ -266,7 +282,7 @@ func prefillEmbedRun(env litert.Environment, cm litert.CompiledModel, pre prefil
 // prefillEmbedDataRun ingests pre-computed text (and per-layer) embeddings for n
 // tokens into the KV cache at start, chunking across prefill buckets. text is
 // [n*H], perLayer is [n*L] (or empty).
-func prefillEmbedDataRun(env litert.Environment, cm litert.CompiledModel, pre prefiller, kv map[string]litert.TensorBuffer, text, perLayer []float32, n, start int) error {
+func prefillEmbedDataRun(env litert.Environment, cm litert.CompiledModel, pre prefiller, kv *kvBanks, text, perLayer []float32, n, start int) error {
 	if n == 0 {
 		return nil
 	}
@@ -312,20 +328,26 @@ func fillEmbedInput(b litert.TensorBuffer, name string, text, perLayer []float32
 }
 
 // embedDecoder holds the fixed decode buffer set for the embedding-input path
-// and a Runner whose arguments are pinned once.
+// and a pair of litert.Runners whose arguments are pinned once. The non-KV
+// buffers are shared; the two runners differ only in which KV bank they read
+// vs write (runA reads bank a and writes bank b; runB the reverse). Each step
+// uses the runner whose input is the cache's current bank, then the banks
+// swap.
 type embedDecoder struct {
-	emb, ple *embedModel
-	in       map[string]litert.TensorBuffer
-	out      map[string]litert.TensorBuffer
-	runner   *litert.Runner
-	ctx      int
-	vocab    int
-	actLen   int     // elements in the activations output (0 if absent)
-	pos      []int32 // scratch: single-element input_pos
-	smp      *sampler
+	emb, ple   *embedModel
+	in         map[string]litert.TensorBuffer
+	out        map[string]litert.TensorBuffer
+	runA, runB *litert.Runner
+	kv         *kvBanks
+	ctx        int
+	vocab      int
+	actLen     int     // elements in the activations output (0 if absent)
+	pos        []int32 // scratch: single-element input_pos
+	smp        *sampler
+	pending    bool // an async run was submitted and not yet awaited
 }
 
-func newEmbedDecoder(env litert.Environment, cm litert.CompiledModel, g sig, kv map[string]litert.TensorBuffer, emb, ple *embedModel, smp *sampler) (*embedDecoder, error) {
+func newEmbedDecoder(env litert.Environment, cm litert.CompiledModel, g sig, kv *kvBanks, emb, ple *embedModel, smp *sampler) (*embedDecoder, error) {
 	in, err := allocNonKV(env, cm, g, false)
 	if err != nil {
 		return nil, err
@@ -335,15 +357,18 @@ func newEmbedDecoder(env litert.Environment, cm litert.CompiledModel, g sig, kv 
 		closeBufs(in)
 		return nil, err
 	}
-	d := &embedDecoder{emb: emb, ple: ple, in: in, out: out, pos: make([]int32, 1), smp: smp}
+	d := &embedDecoder{emb: emb, ple: ple, in: in, out: out, kv: kv, pos: make([]int32, 1), smp: smp}
+	fail := func(err error) (*embedDecoder, error) {
+		closeBufs(in)
+		closeBufs(out)
+		return nil, err
+	}
 
 	maskShape, _ := inputShape(g, "mask") // [1,1,1,ctx]
 	d.ctx = int(maskShape[3])
 	lt, err := g.s.OutputType("logits")
 	if err != nil {
-		closeBufs(in)
-		closeBufs(out)
-		return nil, err
+		return fail(err)
 	}
 	d.vocab = 1
 	for _, dim := range lt.Shape {
@@ -358,22 +383,40 @@ func newEmbedDecoder(env litert.Environment, cm litert.CompiledModel, g sig, kv 
 		}
 	}
 
-	inArr := assemble(g.inNames, in, kv)
-	outArr := assemble(g.outNames, out, kv)
-	for i, b := range inArr {
-		if b == 0 {
-			closeBufs(in)
-			closeBufs(out)
-			return nil, fmt.Errorf("unmapped input[%d] %q", i, g.inNames[i])
+	runner := func(inBank, outBank map[string]litert.TensorBuffer) (*litert.Runner, error) {
+		inArr := assemble(g.inNames, in, inBank)
+		outArr := assemble(g.outNames, out, outBank)
+		for i, b := range inArr {
+			if b == 0 && !kv.allowNullIn(g.inNames[i]) {
+				return nil, fmt.Errorf("unmapped input[%d] %q", i, g.inNames[i])
+			}
 		}
+		return litert.NewRunner(cm, g.idx, inArr, outArr), nil
 	}
-	d.runner = litert.NewRunner(cm, g.idx, inArr, outArr)
+	inA, inB := kv.a, kv.b
+	if kv.single {
+		inA, inB = nil, nil
+	}
+	if d.runA, err = runner(inA, kv.b); err != nil {
+		return fail(err)
+	}
+	if d.runB, err = runner(inB, kv.a); err != nil {
+		return fail(err)
+	}
 	return d, nil
 }
 
 // feed embeds one token, writes it into the KV cache at pos through the decode
-// graph, and leaves logits in d.out["logits"]. It does not sample.
+// graph, and leaves logits in d.out["logits"]. It does not sample. The run is
+// submitted asynchronously when the backend supports it; sampling (or the next
+// feed) waits for completion through the logits buffer's event.
 func (d *embedDecoder) feed(token int32, pos int) error {
+	if d.pending {
+		if err := d.out["logits"].Wait(); err != nil {
+			return err
+		}
+		d.pending = false
+	}
 	text, perLayer, err := embedTokens(d.emb, d.ple, []int32{token})
 	if err != nil {
 		return err
@@ -384,11 +427,23 @@ func (d *embedDecoder) feed(token int32, pos int) error {
 			return err
 		}
 	}
-	return d.runner.Run()
+	run := d.runA // reads bank a
+	if d.kv.bIn {
+		run = d.runB // reads bank b
+	}
+	async, err := run.RunAsync()
+	if err != nil {
+		return err
+	}
+	d.kv.swap()
+	d.pending = async
+	return nil
 }
 
-// sample picks the next token from the logits of the most recent feed.
+// sample picks the next token from the logits of the most recent feed. Locking
+// the logits buffer waits out any in-flight async run.
 func (d *embedDecoder) sample() (int32, error) {
+	d.pending = false
 	return d.smp.sample(d.out["logits"], d.vocab)
 }
 
@@ -414,7 +469,8 @@ func (d *embedDecoder) stepAct(token int32, pos int) (int32, []float32, error) {
 }
 
 func (d *embedDecoder) close() {
-	d.runner.Close()
+	d.runA.Close()
+	d.runB.Close()
 	closeBufs(d.in)
 	closeBufs(d.out)
 }
@@ -431,7 +487,7 @@ type embedSession struct {
 	o       GenOptions
 	tpl     litertlm.PromptTemplates
 	stop    map[int32]bool
-	kv      map[string]litert.TensorBuffer
+	kv      *kvBanks
 	dec     *embedDecoder
 	pos     int
 	started bool
@@ -454,7 +510,7 @@ func (e *Engine) newEmbedSession(o GenOptions) (*embedSession, error) {
 		}
 	}()
 
-	if s.kv, err = allocKV(e.env, e.cm, e.pre.max()); err != nil {
+	if s.kv, err = allocKVBanks(e.env, e.cm, e.pre.max(), e.singleKV()); err != nil {
 		return nil, err
 	}
 	if s.dec, err = newEmbedDecoder(e.env, e.cm, e.decode, s.kv, emb, ple, newSampler(o.Temp, o.TopK, o.TopP, o.Seed)); err != nil {
@@ -470,8 +526,8 @@ func (s *embedSession) Close() {
 	if s.dec != nil {
 		s.dec.close()
 	}
-	for _, b := range s.kv {
-		b.Close()
+	if s.kv != nil {
+		s.kv.close()
 	}
 }
 

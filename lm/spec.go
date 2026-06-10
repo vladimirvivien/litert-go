@@ -19,20 +19,23 @@ import (
 // mtpDraft wraps the compiled tf_lite_mtp_drafter model. Its KV inputs are the
 // base model's KV buffers (shared, layers it owns); it writes no KV. Per draft
 // step it consumes embedding ⊕ activation (f32[1,1,2H]) and emits a token plus
-// projected_activations (the recurrent state for the next step).
+// projected_activations (the recurrent state for the next step). The two
+// runners differ only in which KV bank they read; each draft uses the cache's
+// current bank.
 type mtpDraft struct {
-	model  litert.Model
-	cm     litert.CompiledModel
-	in     map[string]litert.TensorBuffer // input_pos, activations, param_tensor, mask
-	out    map[string]litert.TensorBuffer // logits, projected_activations
-	runner *litert.Runner
-	ctx    int
-	vocab  int
-	actLen int // projected_activations elements
-	pos    []int32
+	model      litert.Model
+	cm         litert.CompiledModel
+	in         map[string]litert.TensorBuffer // input_pos, activations, param_tensor, mask
+	out        map[string]litert.TensorBuffer // logits, projected_activations
+	runA, runB *litert.Runner
+	kv         *kvBanks
+	ctx        int
+	vocab      int
+	actLen     int // projected_activations elements
+	pos        []int32
 }
 
-func newMtpDraft(env litert.Environment, opts litert.Options, section []byte, mainKV map[string]litert.TensorBuffer) (*mtpDraft, error) {
+func newMtpDraft(env litert.Environment, opts litert.Options, section []byte, kv *kvBanks) (*mtpDraft, error) {
 	model, err := litert.OpenModelFromBuffer(env, section)
 	if err != nil {
 		return nil, err
@@ -55,22 +58,33 @@ func newMtpDraft(env litert.Environment, opts litert.Options, section []byte, ma
 		closeBufs(in)
 		return nil, err
 	}
-	d := &mtpDraft{model: model, cm: cm, in: in, out: out, pos: make([]int32, 1)}
+	d := &mtpDraft{model: model, cm: cm, in: in, out: out, kv: kv, pos: make([]int32, 1)}
 	maskShape, _ := inputShape(g, "mask")
 	d.ctx = int(maskShape[3])
 	d.vocab = elemCount(g, "logits", true)
 	d.actLen = elemCount(g, "projected_activations", true)
 
-	inArr := assemble(g.inNames, in, mainKV)
-	outArr := assemble(g.outNames, out, mainKV)
-	for i, b := range inArr {
-		if b == 0 {
-			closeBufs(in)
-			closeBufs(out)
-			return nil, fmt.Errorf("drafter unmapped input[%d] %q", i, g.inNames[i])
+	runner := func(bank map[string]litert.TensorBuffer) (*litert.Runner, error) {
+		inArr := assemble(g.inNames, in, bank)
+		outArr := assemble(g.outNames, out, bank)
+		for i, b := range inArr {
+			if b == 0 {
+				return nil, fmt.Errorf("drafter unmapped input[%d] %q", i, g.inNames[i])
+			}
 		}
+		return litert.NewRunner(cm, g.idx, inArr, outArr), nil
 	}
-	d.runner = litert.NewRunner(cm, g.idx, inArr, outArr)
+	fail := func(err error) (*mtpDraft, error) {
+		closeBufs(in)
+		closeBufs(out)
+		return nil, err
+	}
+	if d.runA, err = runner(kv.a); err != nil {
+		return fail(err)
+	}
+	if d.runB, err = runner(kv.b); err != nil {
+		return fail(err)
+	}
 	return d, nil
 }
 
@@ -106,7 +120,11 @@ func (d *mtpDraft) draft(embedding, activation []float32) (int32, []float32, err
 	if err := writeFloats(d.in["activations"], cat); err != nil {
 		return 0, nil, err
 	}
-	if err := d.runner.Run(); err != nil {
+	run := d.runA // reads bank a
+	if d.kv.bIn {
+		run = d.runB // reads bank b
+	}
+	if err := run.Run(); err != nil {
 		return 0, nil, err
 	}
 	id, err := argmaxF32(d.out["logits"], d.vocab)
@@ -121,7 +139,8 @@ func (d *mtpDraft) draft(embedding, activation []float32) (int32, []float32, err
 }
 
 func (d *mtpDraft) close() {
-	d.runner.Close()
+	d.runA.Close()
+	d.runB.Close()
 	closeBufs(d.in)
 	closeBufs(d.out)
 	d.cm.Close()
@@ -129,17 +148,20 @@ func (d *mtpDraft) close() {
 }
 
 // verifier runs the base model's `verify` signature over width tokens at once.
+// Like the decoder, it reads the KV cache's current bank and writes the other,
+// then the banks swap.
 type verifier struct {
-	emb, ple *embedModel
-	in       map[string]litert.TensorBuffer
-	out      map[string]litert.TensorBuffer
-	runner   *litert.Runner
-	width    int
-	ctx      int
-	vocab    int
+	emb, ple   *embedModel
+	in         map[string]litert.TensorBuffer
+	out        map[string]litert.TensorBuffer
+	runA, runB *litert.Runner
+	kv         *kvBanks
+	width      int
+	ctx        int
+	vocab      int
 }
 
-func newVerifier(env litert.Environment, cm litert.CompiledModel, g sig, mainKV map[string]litert.TensorBuffer, emb, ple *embedModel) (*verifier, error) {
+func newVerifier(env litert.Environment, cm litert.CompiledModel, g sig, kv *kvBanks, emb, ple *embedModel) (*verifier, error) {
 	in, err := allocNonKV(env, cm, g, false)
 	if err != nil {
 		return nil, err
@@ -152,22 +174,33 @@ func newVerifier(env litert.Environment, cm litert.CompiledModel, g sig, mainKV 
 	posShape, _ := inputShape(g, "input_pos")
 	maskShape, _ := inputShape(g, "mask")
 	v := &verifier{
-		emb: emb, ple: ple, in: in, out: out,
+		emb: emb, ple: ple, in: in, out: out, kv: kv,
 		width: int(posShape[0]),
 		ctx:   int(maskShape[3]),
 	}
 	v.vocab = elemCount(g, "logits", true) / v.width
 
-	inArr := assemble(g.inNames, in, mainKV)
-	outArr := assemble(g.outNames, out, mainKV)
-	for i, b := range inArr {
-		if b == 0 {
-			closeBufs(in)
-			closeBufs(out)
-			return nil, fmt.Errorf("verifier unmapped input[%d] %q", i, g.inNames[i])
+	runner := func(inBank, outBank map[string]litert.TensorBuffer) (*litert.Runner, error) {
+		inArr := assemble(g.inNames, in, inBank)
+		outArr := assemble(g.outNames, out, outBank)
+		for i, b := range inArr {
+			if b == 0 {
+				return nil, fmt.Errorf("verifier unmapped input[%d] %q", i, g.inNames[i])
+			}
 		}
+		return litert.NewRunner(cm, g.idx, inArr, outArr), nil
 	}
-	v.runner = litert.NewRunner(cm, g.idx, inArr, outArr)
+	fail := func(err error) (*verifier, error) {
+		closeBufs(in)
+		closeBufs(out)
+		return nil, err
+	}
+	if v.runA, err = runner(kv.a, kv.b); err != nil {
+		return fail(err)
+	}
+	if v.runB, err = runner(kv.b, kv.a); err != nil {
+		return fail(err)
+	}
 	return v, nil
 }
 
@@ -187,14 +220,20 @@ func (v *verifier) verify(pos int, tokens []int32) ([]int32, error) {
 			return nil, err
 		}
 	}
-	if err := v.runner.Run(); err != nil {
+	run := v.runA // reads bank a
+	if v.kv.bIn {
+		run = v.runB // reads bank b
+	}
+	if err := run.Run(); err != nil {
 		return nil, err
 	}
+	v.kv.swap()
 	return argmaxRows(v.out["logits"], v.width, v.vocab)
 }
 
 func (v *verifier) close() {
-	v.runner.Close()
+	v.runA.Close()
+	v.runB.Close()
 	closeBufs(v.in)
 	closeBufs(v.out)
 }
@@ -218,7 +257,13 @@ func elemCount(g sig, name string, out bool) int {
 // decodeSpeculative runs MTP speculative decoding on an embedding-input model
 // that has a verify signature and an mtp_drafter section.
 func decodeSpeculative(env litert.Environment, cm litert.CompiledModel, fileBytes []byte, pre prefiller, decode, verifySig sig, emb, ple *embedModel, prompt []int32, ngen int, stop map[int32]bool, accel litert.HwAccelerator, modelKey string, onToken func(int32)) ([]int, error) {
-	opts, err := gpuCompileOptions(accel, modelKey, "spec", false)
+	if accel == litert.AccelGPU && sigHasInput(decode, "param_tensor") {
+		// The GPU single-buffer KV mode keeps the cache inside each compiled
+		// model's delegate; the drafter cannot share the base model's KV
+		// through bound buffers there.
+		return nil, fmt.Errorf("lm: speculative decoding on GPU is not supported for param_tensor models")
+	}
+	opts, err := gpuCompileOptions(accel, modelKey, "spec", true, sigHasInput(decode, "param_tensor"))
 	if err != nil {
 		return nil, err
 	}
@@ -229,15 +274,11 @@ func decodeSpeculative(env litert.Environment, cm litert.CompiledModel, fileByte
 		return nil, fmt.Errorf("mtp drafter section: %w", err)
 	}
 
-	kv, err := allocKV(env, cm, pre.max())
+	kv, err := allocKVBanks(env, cm, pre.max(), accel == litert.AccelGPU && sigHasInput(decode, "param_tensor"))
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		for _, b := range kv {
-			b.Close()
-		}
-	}()
+	defer kv.close()
 
 	p := len(prompt) - 1
 	if err := prefillEmbedRun(env, cm, pre, kv, emb, ple, prompt[:p], 0); err != nil {

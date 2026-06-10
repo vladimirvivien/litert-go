@@ -61,8 +61,16 @@ func NewRunner(cm CompiledModel, sig int, inputs, outputs []TensorBuffer) *Runne
 }
 
 // Run invokes the bound signature. The buffer contents may have changed since
-// the previous call; the buffer set may not.
+// the previous call; the buffer set may not. The runtime rejects output
+// buffers that still carry a synchronization event from an earlier
+// asynchronous run, so Run detaches stale events from the bound outputs
+// first.
 func (r *Runner) Run() error {
+	for _, h := range r.outArr {
+		if err := TensorBuffer(h).ClearEvent(); err != nil {
+			return err
+		}
+	}
 	runCompiledModelFunc.Call(&r.st,
 		unsafe.Pointer(&r.cm), unsafe.Pointer(&r.sig),
 		unsafe.Pointer(&r.nin), unsafe.Pointer(&r.inp),
