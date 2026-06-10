@@ -19,7 +19,7 @@ import (
 type visionPipeline struct {
 	encModel, adpModel litert.Model
 	encCM, adpCM       litert.CompiledModel
-	opts               litert.Options
+	opts, adpOpts      litert.Options
 	encSigs            map[int]sig
 	adpSigs            map[int]sig
 	sizes              []int // bucket token counts, ascending
@@ -41,7 +41,15 @@ func (e *Engine) ensureVision() (*visionPipeline, error) {
 	if err != nil {
 		return nil, err
 	}
-	v := &visionPipeline{opts: opts}
+	// The vision adapter runs on CPU regardless of the engine accelerator
+	// (the C++ engine's VisionExecutorSettings: "Vision adapter can only run
+	// on CPU").
+	adpOpts, err := litert.NewOptions(litert.AccelCPU)
+	if err != nil {
+		opts.Close()
+		return nil, err
+	}
+	v := &visionPipeline{opts: opts, adpOpts: adpOpts}
 	done := false
 	defer func() {
 		if !done {
@@ -58,7 +66,7 @@ func (e *Engine) ensureVision() (*visionPipeline, error) {
 	if v.adpModel, err = litert.OpenModelFromBuffer(e.env, adpSec); err != nil {
 		return nil, err
 	}
-	if v.adpCM, err = litert.Compile(e.env, v.adpModel, opts); err != nil {
+	if v.adpCM, err = litert.Compile(e.env, v.adpModel, adpOpts); err != nil {
 		return nil, err
 	}
 	if v.encSigs, v.sizes, err = visionBuckets(v.encModel); err != nil {
@@ -237,6 +245,9 @@ func (v *visionPipeline) close() {
 	}
 	if v.opts != 0 {
 		v.opts.Close()
+	}
+	if v.adpOpts != 0 {
+		v.adpOpts.Close()
 	}
 }
 

@@ -10,7 +10,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/vladimirvivien/litert-go/litert"
 	"github.com/vladimirvivien/litert-go/vision"
 )
 
@@ -22,7 +21,7 @@ func TestVisionEncodeSmoke(t *testing.T) {
 	if lib == "" || model == "" {
 		t.Skip("set LITERT_LIB and LITERT_LM_EMBED_MODEL (a gemma-4 .litertlm with vision)")
 	}
-	eng, err := Open(lib, model, litert.AccelCPU)
+	eng, err := Open(lib, model, envAccel())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +76,7 @@ func TestGenerateFromImageSolidColor(t *testing.T) {
 	if lib == "" || model == "" {
 		t.Skip("set LITERT_LIB and LITERT_LM_EMBED_MODEL (a gemma-4 .litertlm with vision)")
 	}
-	eng, err := Open(lib, model, litert.AccelCPU)
+	eng, err := Open(lib, model, envAccel())
 	if err != nil {
 		t.Fatal(err)
 	}

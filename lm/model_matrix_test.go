@@ -21,15 +21,24 @@ import (
 //	LITERT_LM_MODELS   directory of .litertlm files, or one file
 //	LITERT_LM_BACKEND  cpu (default) or gpu
 func TestModelMatrix(t *testing.T) {
+	runModelMatrix(t)
+}
+
+// envAccel selects the test backend from LITERT_LM_BACKEND (cpu default).
+func envAccel() litert.HwAccelerator {
+	if strings.EqualFold(os.Getenv("LITERT_LM_BACKEND"), "gpu") {
+		return litert.AccelGPU
+	}
+	return litert.AccelCPU
+}
+
+func runModelMatrix(t *testing.T) {
 	lib := os.Getenv("LITERT_LIB")
 	models := os.Getenv("LITERT_LM_MODELS")
 	if lib == "" || models == "" {
 		t.Skip("set LITERT_LIB and LITERT_LM_MODELS (a .litertlm file or a directory of them)")
 	}
-	accel := litert.AccelCPU
-	if strings.EqualFold(os.Getenv("LITERT_LM_BACKEND"), "gpu") {
-		accel = litert.AccelGPU
-	}
+	accel := envAccel()
 
 	var files []string
 	if fi, err := os.Stat(models); err == nil && fi.IsDir() {

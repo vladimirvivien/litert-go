@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/vladimirvivien/litert-go/audio"
-	"github.com/vladimirvivien/litert-go/litert"
 )
 
 // The audio encoder+adapter pipeline must run on a mel spectrogram and yield
@@ -17,7 +16,7 @@ func TestAudioEncodeSmoke(t *testing.T) {
 	if lib == "" || model == "" {
 		t.Skip("set LITERT_LIB and LITERT_LM_EMBED_MODEL (a gemma-4 .litertlm with audio)")
 	}
-	eng, err := Open(lib, model, litert.AccelCPU)
+	eng, err := Open(lib, model, envAccel())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +63,7 @@ func TestGenerateFromAudioRuns(t *testing.T) {
 	if lib == "" || model == "" {
 		t.Skip("set LITERT_LIB and LITERT_LM_EMBED_MODEL (a gemma-4 .litertlm with audio)")
 	}
-	eng, err := Open(lib, model, litert.AccelCPU)
+	eng, err := Open(lib, model, envAccel())
 	if err != nil {
 		t.Fatal(err)
 	}
