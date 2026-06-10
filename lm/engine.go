@@ -212,6 +212,7 @@ func Open(libDir, modelPath string, accel litert.HwAccelerator) (*Engine, error)
 		}
 		e.md, _ = litertlm.ReadMetadata(e.fileBytes)
 		if sp, serr := litertlm.SectionBytes(e.fileBytes, litertlm.SectionSPTokenizer); serr == nil {
+			sp = rewriteRawSpacePieces(sp)
 			p, perr := sentencepiece.NewProcessor(bytes.NewReader(sp))
 			if perr != nil {
 				return nil, fmt.Errorf("load tokenizer: %w", perr)
