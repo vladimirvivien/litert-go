@@ -2,7 +2,7 @@
 // platform accelerator, and on Windows the DirectX Shader Compiler) and
 // prints the directory holding them — usable as LITERT_LIB:
 //
-//	LITERT_LIB=$(go run github.com/vladimirvivien/litert-go/cmd/libfetch)
+//	LITERT_LIB=$(go run github.com/vladimirvivien/litert-go/examples/libfetch)
 package main
 
 import (

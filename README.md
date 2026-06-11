@@ -1,34 +1,38 @@
 # litert-go
 
-A no-CGO Go binding for the **LiteRT CompiledModel C API**, with a Go-driven LLM
-decode runtime (bucketed prefill, fixed-context KV cache, greedy decode) built on
-top. Prompts longer than a single prefill bucket are chunked across buckets at
-increasing positions, up to the model's KV-cache context length.
+A pure-Go (no CGO) library for on-device LLM inference, built directly on the
+**LiteRT CompiledModel C API**: a `purego`-based binding plus a Go-authored
+LLM runtime (chat templating, bucketed prefill, KV-cache sessions, sampling,
+speculative decoding, vision/audio) on top. CPU and GPU (WebGPU) backends.
 
-`cmd/decode` runs the full pipeline on CPU: text → tokenizer (pure-Go, loaded
-from the `.litertlm`'s embedded tokenizer section) → prefill → greedy decode →
-detokenize → text. Both tokenizer families are supported: SentencePiece (via
-`eliben/go-sentencepiece`) and HuggingFace byte-level BPE (`hftok`, e.g. Qwen).
-
-```
-decode -lib <libLiteRt dir> -model gemma3-1b-it-int4.litertlm -text "The capital of France is"
-output: " Paris."
-```
-
-Models are statically shaped: the KV cache is the full fixed context, `decode`
-produces `logits f32[1,1,vocab]`, and no resize or KV-cache growth occurs.
-
-**Constraints in the binding:**
-
-- The MSVC build of `libLiteRt` lays out `LiteRtRankedTensorType` with dimensions
-  at offset 12 (the `rank`/`has_strides` bitfields are not packed); the Windows
-  binding reads shapes accordingly.
-- Every Go variable whose address reaches the C side must be pinned with
-  `runtime.Pinner` for the duration of the call: the goroutine stack can move
-  mid-call and the stack mover does not rewrite addresses laundered through
-  `unsafe.Pointer`. Scope one `Pinner` per C call. See `litert/ffi.go`.
+litert-go is a **library**: every capability is a programmatic API intended
+for embedding in other projects. The `examples/` directory holds runnable
+demonstrations; nothing lives only behind a flag.
 
 **Module:** `github.com/vladimirvivien/litert-go` · **Go:** 1.26.2
+
+## Getting the runtime libraries
+
+The binding loads `libLiteRt` and a platform accelerator at runtime. The
+`libfetch` package downloads them from the canonical LiteRT prebuilt releases
+(plus, on Windows, the DirectX Shader Compiler the WebGPU accelerator needs):
+
+```go
+import "github.com/vladimirvivien/litert-go/libfetch"
+
+dir, err := libfetch.Fetch(ctx) // current platform, validated release
+```
+
+or as a one-liner via the example CLI:
+
+```
+LITERT_LIB=$(go run github.com/vladimirvivien/litert-go/examples/libfetch)
+```
+
+Fetches are checksum-verified and idempotent. A self-built `libLiteRt` from
+`google-ai-edge/litert` works too — point `LITERT_LIB` (or the lib-dir
+argument) at its directory. The runtime and accelerator must come from the
+same release: a runtime rejects an accelerator built from different sources.
 
 ## Library
 
@@ -38,7 +42,7 @@ import (
 	"github.com/vladimirvivien/litert-go/lm"
 )
 
-eng, err := lm.Open(libDir, "gemma3-1b-it-int4.litertlm", litert.AccelCPU)
+eng, err := lm.Open(libDir, "gemma3-1b-it-int4.litertlm", litert.AccelGPU)
 defer eng.Close()
 
 out, _ := eng.Generate("What is the capital of France?", true /* chat */, lm.GenOptions{MaxTokens: 32})
@@ -46,10 +50,12 @@ out, _ := eng.Generate("What is the capital of France?", true /* chat */, lm.Gen
 // Streaming (Generate/Send have token-by-token variants):
 _, _ = eng.GenerateStream("…", true, lm.GenOptions{MaxTokens: 64}, func(piece string) { fmt.Print(piece) })
 
-// A system prompt (GenOptions.System) steers the assistant, rendered at the
-// conversation start through the model's system affixes:
+// Multi-turn with a KV-reuse session; GenOptions.System steers the assistant:
 conv, _ := eng.NewConversation(lm.GenOptions{MaxTokens: 64, Temp: 0.8, TopK: 40,
 	System: "You are a terse assistant. Answer in one sentence."})
+defer conv.Close()
+reply, _ := conv.Send("My name is Vlad.")
+reply, _ = conv.SendStream("What is my name?", func(piece string) { fmt.Print(piece) })
 
 // Vision/audio (gemma-4): generate text from a prompt + image/clip; mark the
 // position with <start_of_image> / <start_of_audio>:
@@ -57,13 +63,12 @@ img, _ := os.ReadFile("photo.jpg")
 caption, _ := eng.GenerateFromImage("<start_of_image>Describe this image.", img, 0 /* budget */, lm.GenOptions{MaxTokens: 64})
 pcm, _ := audio.DecodeWAV(wavBytes) // 16kHz mono
 answer, _ := eng.GenerateFromAudio("<start_of_audio>What do you hear?", pcm, lm.GenOptions{MaxTokens: 64})
-defer conv.Close()
-reply, _ := conv.Send("My name is Vlad.")
-reply, _ = conv.SendStream("What is my name?", func(piece string) { fmt.Print(piece) })
 ```
 
 `GenOptions.Spec` enables MTP speculative decoding when the model supports it
-(`eng.SupportsSpec()`). The `cmd/decode` command is a thin CLI over this package.
+(`eng.SupportsSpec()`). Both tokenizer families embedded in `.litertlm`
+containers are supported: SentencePiece (including HF-converted raw-space
+vocabs — Qwen3-0.6B, Phi-4) and HuggingFace byte-level BPE (`hftok`).
 
 ## Layout
 
@@ -74,128 +79,87 @@ litert/        no-CGO binding to the LiteRT C API (purego + jupiterrider/ffi)
   litert.go      typed wrappers + enums: Environment, Options, Model, Signature,
                  CompiledModel, TensorBuffer
   run.go         Runner — repeated Run over a fixed buffer set, arguments pinned once
+libfetch/      runtime-library acquisition from the LiteRT prebuilt releases
 litertlm/      .litertlm container reader (minimal FlatBuffer parser)
-  litertlm.go    Sections (+ model_type hints) / SectionTFLite (selects the
-                 prefill/decode graph) / SectionBytes
+  litertlm.go    Sections (+ model_type hints) / SectionTFLite / SectionBytes
   metadata.go    ReadMetadata — model family + max tokens (protobuf scan)
 hftok/         pure-Go HuggingFace byte-level BPE tokenizer (Qwen, GPT-2 family)
 vision/        pure-Go image preprocessing (decode, aspect-resize, patchify)
 audio/         pure-Go audio preprocessing (WAV decode, mel spectrogram, FFT)
-lm/            LLM runtime: Engine.Open / Generate / NewChat / GenerateFrom{Image,Audio}
+lm/            LLM runtime: Open / Generate / NewConversation / GenerateFrom{Image,Audio}
   engine.go      Engine, tokenizer abstraction, chat templating, token-input decode
   embed.go       embedding-input pipeline (gemma 3n/4: dual embedders, i8 KV)
   multimodal.go  shared vision/audio embedding splice (sentinel + markers)
-  vision.go      gemma-4 vision: encoder + adapter, image-embedding splice
-  audio.go       gemma-4 audio: encoder + adapter, audio-embedding splice
+  vision.go      gemma-4 vision: encoder (engine backend) + adapter (CPU)
+  audio.go       gemma-4 audio: encoder + adapter
   spec.go        MTP speculative decoding (drafter + verify)
   sample.go      temperature / top-k / top-p sampling
-cmd/decode/    thin CLI over lm (-text / -prompt / -repl, -chat, -system, -image, -audio, -spec, sampling)
-cmd/siginfo/   dump a model's sections and signature prefill shapes
-cmd/spike/     signature dump, compile, and smoke-run a single signature
-cmd/repro/     ffi argument-pinning regression guard
+examples/      runnable demos of the library API
+  decode/        full pipeline CLI (-text / -repl, -chat, -image, -audio, -spec, sampling)
+  libfetch/      runtime-library download CLI
+  siginfo/       dump a model's sections and signature prefill shapes
 ```
 
-The binding targets the canonical LiteRT C API in `google-ai-edge/litert`
-(headers under `litert/c/`, API v0.1.0) — not the copy vendored inside LiteRT-LM,
-whose `LiteRtCreateModelFrom*` functions lack the leading `environment` argument.
+The binding targets the canonical LiteRT C API in `google-ai-edge/litert`.
+The 2.1.5 release's `LiteRtCreateModelFromBuffer` takes no leading
+`environment` argument while newer runtimes add one; the binding detects the
+variant at load time, so both work.
 
-## Prerequisites
+**Binding constraints:**
 
-- **`libLiteRt`** shared library, built from `google-ai-edge/litert`:
-  - Windows: `bazelisk build //litert/c:libLiteRt --config=windows` → `bazel-bin/litert/c/libLiteRt.dll`
-  - Linux/macOS: `//litert/c:litert_runtime_c_api_so` → `libLiteRt.so` / `.dylib`
+- The MSVC build of `libLiteRt` lays out `LiteRtRankedTensorType` with
+  dimensions at offset 12 (the `rank`/`has_strides` bitfields are not packed);
+  the Windows binding reads shapes accordingly.
+- Every Go variable whose address reaches the C side must be pinned with
+  `runtime.Pinner` for the duration of the call: the goroutine stack can move
+  mid-call and the stack mover does not rewrite addresses laundered through
+  `unsafe.Pointer`. Scope one `Pinner` per C call. See `litert/ffi.go`.
+- `litert.Load` binds one library per process.
 
-  Point to its directory with `LITERT_LIB` or the `-lib` flag.
-- **A model** — a `.litertlm` container (the embedded TFLite section is extracted)
-  or a raw `.tflite`, via `-model`.
+## Backends
 
-## Usage
+- **CPU** (XNNPACK): every supported model.
+- **GPU** (WebGPU — Direct3D 12 on Windows): token- and embedding-input
+  models, vision, and audio. The engine applies the GPU configuration the
+  C++ LiteRT-LM engine uses: a compact program/weight cache (warm starts in
+  seconds), native-layout KV with double-buffered banks, async submission,
+  and the single-buffer KV mode gemma-4-class (param_tensor) models require.
+  The vision adapter always runs on CPU. Speculative decoding on GPU is not
+  supported for param_tensor models.
 
-Decode text:
+## Examples
 
-```
-decode -lib /path/to/libLiteRt -model model.litertlm -text "The capital of France is" -n 16
-```
-
-`-text` uses the model's embedded SentencePiece tokenizer; `-prompt` takes
-comma-separated token IDs instead. `-n` caps the number of generated tokens.
-Decoding is greedy unless `-temp` is set, which enables temperature sampling
-with optional `-topk` / `-topp` (nucleus) and `-seed`:
-
-```
-decode -lib ... -model model.litertlm -chat -text "..." -temp 0.8 -topk 40 -topp 0.95
-```
-
-`-chat` wraps `-text` in the model's chat template, read from the container's
-`LlmMetadata` (`prompt_templates` affixes plus `start_token` / `stop_tokens`),
-and stops decoding on the model's turn-end token:
+Decode text (greedy unless `-temp` is set; `-topk` / `-topp` / `-seed`
+optional):
 
 ```
-decode -lib /path/to/libLiteRt -model model.litertlm -chat -text "What is the capital of France?"
+go run ./examples/decode -lib $LITERT_LIB -model model.litertlm -backend gpu \
+    -chat -text "What is the capital of France?"
 ```
 
-Containers that carry only a Jinja template (e.g. Gemma 4) fall back to the
-documented fixed affixes for that family, keyed on `llm_model_type`.
+`-chat` wraps the prompt in the model's chat template (from the container's
+`LlmMetadata`); `-repl` is interactive multi-turn chat over a KV-reuse
+session; `-image` / `-audio` run the gemma-4 multimodal paths; `-spec`
+enables MTP speculative decoding (prints tokens/verify-pass to stderr).
 
-`-repl` is interactive multi-turn chat: each stdin line is a user turn, the
-running history is re-rendered through the chat template and decoded, and the
-reply is kept for context.
-
-```
-decode -lib /path/to/libLiteRt -model model.litertlm -repl
-```
-
-`-spec` enables MTP speculative decoding on models that carry a `verify`
-signature and a `tf_lite_mtp_drafter` section (Gemma 4): the drafter proposes K
-tokens, the base model verifies them in one pass, and the matching prefix is
-accepted. Output is identical to greedy. It prints an acceptance rate
-(tokens/verify-pass) to stderr.
+Dump a model's signatures and prefill bucket shapes:
 
 ```
-decode -lib /path/to/libLiteRt -model gemma-4-E2B-it.litertlm -chat -text "..." -spec
-```
-
-Dump a model's signatures (names, element types, shapes):
-
-```
-spike -lib /path/to/libLiteRt -model model.tflite
-```
-
-Compile and report accelerator coverage, or smoke-run one signature with zeroed
-inputs (`fully accelerated: true` means a backend owns the whole graph with no
-CPU fallback):
-
-```
-spike -lib ... -model ... -backend cpu
-spike -lib ... -model ... -backend gpu
-spike -lib ... -model ... -backend cpu -smoke -sig decode
+go run ./examples/siginfo -lib $LITERT_LIB -model model.litertlm
 ```
 
 ## Limitations
 
-- CPU only. `-backend gpu` selects LiteRT's default GPU backend; forcing the
-  OpenCL backend needs opaque GPU options that are not bound.
-- Sampling (`-temp` / `-topk` / `-topp` / `-seed`) on the standard decode paths;
-  greedy when `-temp 0` (the default). MTP speculative decoding (`-spec`) is
-  greedy-only and exact (greedy-equivalent output), accepting multiple tokens
-  per verify pass — but CPU break-even: the wide verify pass costs ~K× a decode
-  on CPU, so the win needs a GPU backend (where it parallelizes).
 - Context is bounded by the model's KV-cache size (e.g. 4096 for gemma3-1b).
-  Prefill covers the prompt by chunking across the model's prefill buckets — a
-  short prompt uses the smallest bucket that fits; a long one uses repeated
-  largest-bucket chunks plus a fitting remainder.
-- Both token-input models (gemma3, qwen3, …) and embedding-input models (Gemma
-  3n/4, which run separate text + per-layer embedder stages into the main graph)
-  are supported. `-repl` is interactive multi-turn chat over a KV-reuse session
-  that ingests only each turn's new tokens: token-input models through the decode
-  graph, embedding-input models through a prefill-at-offset into the retained
-  cache. Multi-section containers select sections by their `model_type` hint.
-- Multimodal (gemma-4): `GenerateFromImage` / `-image` and `GenerateFromAudio` /
-  `-audio` run the vision/audio encoder + adapter and splice the embeddings into
-  the prompt at a `<start_of_image>` / `<start_of_audio>` marker. Image and audio
-  preprocessing are pure Go (gamma-space resize; hand-rolled FFT mel spectrogram);
-  functionally correct, validated qualitatively (no reference oracle). `DecodeWAV`
-  handles 16 kHz mono PCM16/float32.
+  Prefill covers the prompt by chunking across the model's prefill buckets.
+- Models are statically shaped; no KV-cache growth or tensor resize occurs.
+- MTP speculative decoding is greedy-only and exact; on CPU the wide verify
+  pass costs ~K× a decode step, so the speedup needs GPU.
+- The 2.1.5 runtime exposes no log-severity control; C-side INFO lines reach
+  stderr.
+- Image and audio preprocessing are pure Go (gamma-space resize; hand-rolled
+  FFT mel spectrogram); validated qualitatively. `DecodeWAV` handles 16 kHz
+  mono PCM16/float32.
 
 ## Build & test
 
@@ -205,36 +169,21 @@ go vet ./...
 go test ./...
 ```
 
-Unit tests run without hardware. The `lm` package also has env-gated integration
-tests against real models. Token-input model (greedy determinism, stream ≡
-non-stream, `Session` ≡ `Generate`, seeded sampling, multi-turn):
+Unit tests run without hardware. The `lm` package has env-gated integration
+tests against real models:
 
 ```
 LITERT_LIB=/abs/lib LITERT_LM_MODEL=/abs/model.litertlm go test ./lm
-```
-
-Embedding-input model (Gemma 3n/4 — Session turn 1 ≡ `Generate`, multi-turn
-prefill-at-offset retains context):
-
-```
 LITERT_LIB=/abs/lib LITERT_LM_EMBED_MODEL=/abs/gemma-4.litertlm go test ./lm
 ```
 
-## Benchmarks
-
-The `litertlm` reader/loader benchmarks are gated on a real container:
-
-```
-LITERTLM_BENCH_FILE=/abs/path/model.litertlm go test ./litertlm -bench . -benchmem
-```
-
-`BenchmarkSections` / `BenchmarkSectionTFLite` measure the in-memory parser;
-`BenchmarkReadTFLite` measures the full load (file read + parse) with throughput
-over file size.
-
-The `litert` ffi-call benchmarks are gated on `LITERT_LIB` plus a model in
-`LITERT_BENCH_MODEL`:
+`TestModelMatrix` runs a four-check battery (greedy generate, stream ≡
+generate, tokenize round-trip, multi-turn) over a directory of models:
 
 ```
-go test ./litert -bench . -benchmem
+LITERT_LIB=/abs/lib LITERT_LM_MODELS=/abs/models LITERT_LM_BACKEND=gpu go test ./lm -run TestModelMatrix
 ```
+
+(`run-matrix.sh` drives it one process per model.) The `litert` ffi-call
+benchmarks gate on `LITERT_LIB` + `LITERT_BENCH_MODEL`; the `litertlm`
+reader benchmarks gate on `LITERTLM_BENCH_FILE`.
