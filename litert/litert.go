@@ -63,6 +63,7 @@ const (
 	ElementBFloat16 ElementType = 19
 )
 
+// String names the element type for logs and error messages.
 func (e ElementType) String() string {
 	switch e {
 	case ElementFloat32:
@@ -785,6 +786,9 @@ func (b TensorBuffer) Clear() error {
 	return invoke(&pin, clearTensorBufferDataFunc, unsafe.Pointer(&h)).err("LiteRtClearTensorBuffer")
 }
 
+// ClearEvent detaches the buffer's synchronization event without waiting on
+// it. The runtime rejects output buffers that still carry an event from an
+// earlier asynchronous run.
 func (b TensorBuffer) ClearEvent() error {
 	var pin runtime.Pinner
 	defer pin.Unpin()

@@ -20,6 +20,7 @@ const (
 	ModelFastVLM       ModelType = 9
 )
 
+// String returns the model_type hint as recorded in the container.
 func (m ModelType) String() string {
 	switch m {
 	case ModelGeneric:

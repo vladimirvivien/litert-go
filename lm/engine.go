@@ -416,7 +416,7 @@ type GenOptions struct {
 // the prompt is wrapped in the model's chat template.
 func (e *Engine) Generate(ctx context.Context, prompt string, chat bool, o GenOptions) (string, error) {
 	if e.tok == nil {
-		return "", fmt.Errorf("lm: model has no tokenizer; use GenerateIDs")
+		return "", fmt.Errorf("%w; use GenerateIDs", ErrNoTokenizer)
 	}
 	ids, err := buildPrompt(e.tok, e.md, o.System, prompt, chat)
 	if err != nil {
@@ -439,7 +439,7 @@ func (e *Engine) GenerateIDs(ctx context.Context, prompt []int32, o GenOptions) 
 // each newly decoded text fragment as it is produced. It returns the full text.
 func (e *Engine) GenerateStream(ctx context.Context, prompt string, chat bool, o GenOptions, onPiece func(string)) (string, error) {
 	if e.tok == nil {
-		return "", fmt.Errorf("lm: model has no tokenizer; use GenerateIDs")
+		return "", fmt.Errorf("%w; use GenerateIDs", ErrNoTokenizer)
 	}
 	ids, err := buildPrompt(e.tok, e.md, o.System, prompt, chat)
 	if err != nil {
@@ -501,11 +501,11 @@ type Chat struct {
 // chat template.
 func (e *Engine) NewChat(o GenOptions) (*Chat, error) {
 	if e.tok == nil {
-		return nil, fmt.Errorf("lm: model has no tokenizer")
+		return nil, ErrNoTokenizer
 	}
 	tpl, ok := e.md.Templates()
 	if !ok {
-		return nil, fmt.Errorf("lm: model has no chat template (model type %q)", e.md.ModelType)
+		return nil, fmt.Errorf("%w (model type %q)", ErrNoChatTemplate, e.md.ModelType)
 	}
 	c := &Chat{e: e, o: o, tpl: tpl}
 	if o.System != "" {
@@ -553,6 +553,7 @@ func (c *Chat) send(ctx context.Context, userText string, onPiece func(string)) 
 
 // Conversation is a multi-turn chat session. Both Chat (re-prefills the history
 // each turn) and Session (reuses the KV cache across turns) satisfy it.
+// Implementations are not safe for concurrent use.
 type Conversation interface {
 	Send(ctx context.Context, userText string) (string, error)
 	SendStream(ctx context.Context, userText string, onPiece func(string)) (string, error)
@@ -594,14 +595,14 @@ type Session struct {
 // it), handled by the embedSession that NewConversation returns.
 func (e *Engine) NewSession(o GenOptions) (*Session, error) {
 	if e.tok == nil {
-		return nil, fmt.Errorf("lm: model has no tokenizer")
+		return nil, ErrNoTokenizer
 	}
 	if sigHasInput(e.decode, "embeddings") {
 		return nil, fmt.Errorf("lm: NewSession supports token-input models only")
 	}
 	tpl, ok := e.md.Templates()
 	if !ok {
-		return nil, fmt.Errorf("lm: model has no chat template (model type %q)", e.md.ModelType)
+		return nil, fmt.Errorf("%w (model type %q)", ErrNoChatTemplate, e.md.ModelType)
 	}
 	kv, err := allocKVBanks(e.env, e.cm, e.pre.max(), false)
 	if err != nil {

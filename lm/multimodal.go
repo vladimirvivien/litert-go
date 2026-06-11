@@ -20,10 +20,10 @@ const (
 // requireMultiModal checks the model can splice modality embeddings.
 func (e *Engine) requireMultiModal(fn string) error {
 	if e.tok == nil {
-		return fmt.Errorf("lm: model has no tokenizer")
+		return ErrNoTokenizer
 	}
 	if !sigHasInput(e.decode, "embeddings") {
-		return fmt.Errorf("lm: %s requires an embedding-input model", fn)
+		return fmt.Errorf("%s: %w", fn, ErrNotEmbeddingModel)
 	}
 	return nil
 }
@@ -62,7 +62,7 @@ func (e *Engine) generateModal(ctx context.Context, prompt, marker, beginTok, en
 func (e *Engine) buildModalPrompt(prompt, system, marker, beginTok, endTok string, softToken int32, tReal int) ([]int32, error) {
 	tpl, ok := e.md.Templates()
 	if !ok {
-		return nil, fmt.Errorf("lm: model has no chat template (model type %q)", e.md.ModelType)
+		return nil, fmt.Errorf("%w (model type %q)", ErrNoChatTemplate, e.md.ModelType)
 	}
 	render := renderSystem(tpl, system) + tpl.User.Prefix + prompt + tpl.User.Suffix + tpl.Model.Prefix
 	before, after, found := strings.Cut(render, marker)

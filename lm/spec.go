@@ -262,7 +262,7 @@ func decodeSpeculative(ctx context.Context, env litert.Environment, cm litert.Co
 		// The GPU single-buffer KV mode keeps the cache inside each compiled
 		// model's delegate; the drafter cannot share the base model's KV
 		// through bound buffers there.
-		return nil, fmt.Errorf("lm: speculative decoding on GPU is not supported for param_tensor models")
+		return nil, fmt.Errorf("%w for param_tensor models on GPU", ErrSpecUnsupported)
 	}
 	opts, err := gpuCompileOptions(accel, modelKey, cacheDir, "spec", true, sigHasInput(decode, "param_tensor"))
 	if err != nil {
