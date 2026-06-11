@@ -1,10 +1,15 @@
-// Package litert is a no-CGO Go binding for the LiteRT C API (the CompiledModel
-// interface), bound via jupiterrider/ffi. It covers the subset needed by the
-// Spike 0 harness: model loading, signature introspection, compilation, and
-// running a signature with tensor buffers.
+// Package litert is a no-CGO Go binding for the LiteRT C API (the
+// CompiledModel interface), bound via purego and jupiterrider/ffi. LiteRT
+// handles are opaque C pointers, so the binding wraps each as a typed
+// uintptr, resolves C symbols lazily on first use, and pins every Go
+// variable whose address crosses the boundary (the pinning rules are at the
+// bottom of this file).
 //
-// This is exploratory scaffolding for the litert-go proposal. The binding
-// surface is intentionally minimal and grows as the executor takes shape.
+// The surface covers what an LLM executor needs: environment and
+// compilation options (including accelerator opaque options), model loading
+// and signature introspection, compiled-model execution (synchronous,
+// asynchronous with buffer events, and the pinned-argument Runner for hot
+// loops), and tensor buffers.
 package litert
 
 import (

@@ -1,4 +1,4 @@
-// Package lm is a small LLM runtime over the LiteRT CompiledModel C API. An
+// Package lm is an LLM runtime over the LiteRT CompiledModel C API. An
 // Engine loads a .litertlm (or raw .tflite) model — its tokenizer, metadata,
 // and prefill/decode/verify signatures — and generates text by driving the
 // static-executor protocol: prefill an N-token prompt, then decode one token at

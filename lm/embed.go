@@ -14,8 +14,7 @@ import (
 // not token IDs: each token is run through a text embedder (token -> embeddings
 // f32[..,H]) and, when the graph asks for it, a per-layer embedder (token ->
 // per_layer_embeddings f32[..,L,D]). Those feed prefill/decode along with
-// input_pos, a boolean attention mask (true = attend), the single-bank i8 KV
-// cache, and — on gemma 4 — a param_tensor ([start, start+len, start+len])
+// input_pos, a boolean attention mask (true = attend), the i8 KV cache, and — on gemma 4 — a param_tensor ([start, start+len, start+len])
 // driving the KV-cache write index. Semantics follow LiteRT-LM's
 // llm_litert_compiled_model_executor. gemma 3n omits param_tensor and uses
 // input_pos for the cache index.

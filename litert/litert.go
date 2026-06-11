@@ -99,7 +99,7 @@ type (
 	bufferRequirements uintptr
 )
 
-// TensorType mirrors the fields of LiteRtRankedTensorType the spike needs.
+// TensorType mirrors the element type and shape of LiteRtRankedTensorType.
 type TensorType struct {
 	ElementType ElementType
 	Shape       []int32
@@ -110,7 +110,7 @@ type TensorType struct {
 // bitfields into one word, so the struct is: element_type[0:4], rank[4:8],
 // has_strides[8:12], dimensions[12:44], strides[44:76] = 76 bytes. 80 is a safe
 // over-allocation. (The non-MSVC layout packs rank/has_strides and puts
-// dimensions at offset 8; this binding currently targets the Windows DLL.)
+// dimensions at offset 8; the binding targets the Windows DLL layout.)
 const (
 	rankedTensorTypeSize = 80
 	dimsOffset           = 12
@@ -210,9 +210,8 @@ func (e Environment) Close() {
 }
 
 // NewOptions creates compilation options targeting the given accelerator(s).
-//
-// Selecting AccelGPU uses LiteRT's default GPU backend. Forcing the OpenCL
-// backend (Spike 0b) additionally requires the GPU opaque options, not yet bound.
+// Selecting AccelGPU uses LiteRT's default GPU backend; backend-specific
+// configuration travels through Options.AddOpaqueOption.
 func NewOptions(accel HwAccelerator) (Options, error) {
 	o, err := createOptions()
 	if err != nil {
@@ -540,7 +539,7 @@ func (c CompiledModel) Close() {
 }
 
 // FullyAccelerated reports whether every op was delegated to the selected
-// accelerator (i.e. no CPU fallback). It is the key Spike 0b signal.
+// accelerator (i.e. no CPU fallback).
 func (c CompiledModel) FullyAccelerated() (bool, error) {
 	var pin runtime.Pinner
 	defer pin.Unpin()
