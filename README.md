@@ -5,22 +5,26 @@ A pure-Go (no CGO) library for on-device LLM inference, built directly on the
 LLM runtime (chat templating, bucketed prefill, KV-cache sessions, sampling,
 speculative decoding, vision/audio) on top. CPU and GPU (WebGPU) backends.
 
-litert-go is a **library**: every capability is a programmatic API intended
-for embedding in other projects. The `examples/` directory holds runnable
-demonstrations; nothing lives only behind a flag.
+The kernels stay inside LiteRT's shared libraries; everything above them —
+the orchestration — is Go source that can be read, debugged, and extended
+without a C++ toolchain. litert-go is a **library**: every capability is a
+programmatic API for embedding in other projects. The `examples/` directory
+holds runnable demonstrations.
 
 **Module:** `github.com/vladimirvivien/litert-go` · **Go:** 1.26.2
 
 ## Getting the runtime libraries
 
-The binding loads `libLiteRt` and a platform accelerator at runtime. The
+litert-go implements no compute kernels: all inference executes inside
+`libLiteRt` and a platform accelerator library, which the binding loads at
+runtime. Putting those libraries on disk is therefore the first step. The
 `libfetch` package downloads them from the canonical LiteRT prebuilt releases
 (plus, on Windows, the DirectX Shader Compiler the WebGPU accelerator needs):
 
 ```go
 import "github.com/vladimirvivien/litert-go/libfetch"
 
-dir, err := libfetch.Fetch(ctx) // current platform, validated release
+dir, err := libfetch.Fetch(ctx) // current platform, default release (2.1.5)
 ```
 
 or as a one-liner via the example CLI:
@@ -35,6 +39,13 @@ argument) at its directory. The runtime and accelerator must come from the
 same release: a runtime rejects an accelerator built from different sources.
 
 ## Library
+
+The `lm` package is the LLM runtime. An `Engine` owns one model — loaded
+from a `.litertlm` container, compiled for one accelerator — and serves all
+generation from it: single-shot, streaming (a callback per text piece),
+multi-turn conversations that retain the KV cache across turns, and
+image/audio prompts. Calls are synchronous and cancel through their context;
+an Engine serves one call at a time.
 
 ```go
 import (
@@ -58,7 +69,7 @@ _, _ = eng.GenerateStream(ctx, "…", true, lm.GenOptions{MaxTokens: 64}, func(p
 conv, _ := eng.NewConversation(lm.GenOptions{MaxTokens: 64, Temp: 0.8, TopK: 40,
 	System: "You are a terse assistant. Answer in one sentence."})
 defer conv.Close()
-reply, _ := conv.Send(ctx, "My name is Vlad.")
+reply, _ := conv.Send(ctx, "My name is Alice.")
 reply, _ = conv.SendStream(ctx, "What is my name?", func(piece string) { fmt.Print(piece) })
 
 // Vision/audio (gemma-4): generate text from a prompt + image/clip; mark the
@@ -72,10 +83,14 @@ answer, _ := eng.GenerateFromAudio(ctx, "<start_of_audio>What do you hear?", pcm
 Cancelling ctx stops generation between decode steps with `context.Canceled`.
 `GenOptions.Spec` enables MTP speculative decoding when the model supports it
 (`eng.SupportsSpec()`). Both tokenizer families embedded in `.litertlm`
-containers are supported: SentencePiece (including HF-converted raw-space
-vocabs — Qwen3-0.6B, Phi-4) and HuggingFace byte-level BPE (`hftok`).
+containers are supported: SentencePiece (gemma, Qwen3-0.6B, Phi-4) and
+HuggingFace byte-level BPE (`hftok`; Qwen3-4B).
 
 ## Layout
+
+The packages layer bottom-up — the C binding, the container / tokenizer /
+preprocessing support packages, and the `lm` runtime on top. Each is usable
+on its own.
 
 ```
 litert/        no-CGO binding to the LiteRT C API (purego + jupiterrider/ffi)
@@ -108,9 +123,10 @@ examples/      runnable demos of the library API
 The binding targets the canonical LiteRT C API in `google-ai-edge/litert`.
 The 2.1.5 release's `LiteRtCreateModelFromBuffer` takes no leading
 `environment` argument while newer runtimes add one; the binding detects the
-variant at load time, so both work.
+variant at load time.
 
-**Binding constraints:**
+**Binding constraints.** Crossing into C without CGO means the Go runtime
+has no knowledge of the C side; these rules keep the boundary sound:
 
 - The MSVC build of `libLiteRt` lays out `LiteRtRankedTensorType` with
   dimensions at offset 12 (the `rank`/`has_strides` bitfields are not packed);
@@ -123,19 +139,21 @@ variant at load time, so both work.
 
 ## Backends
 
+A model compiles for exactly one accelerator, chosen at `Open` time
+(`WithAccelerator`); the backend changes where kernels execute, not the API.
+
 - **CPU** (XNNPACK): every supported model.
 - **GPU** (WebGPU — Direct3D 12 on Windows): token- and embedding-input
-  models, vision, and audio. The engine applies the GPU configuration the
-  C++ LiteRT-LM engine uses: a compact program/weight cache (warm starts in
-  seconds), native-layout KV with double-buffered banks, async submission,
-  and the single-buffer KV mode gemma-4-class (param_tensor) models require.
-  The vision adapter always runs on CPU. Speculative decoding on GPU is not
-  supported for param_tensor models.
+  models, vision, and audio. Compiled GPU programs and weights persist in a
+  cache directory (`WithGPUCacheDir` overrides the location): the first run
+  on a model compiles its kernels and is slow; warm runs initialize in
+  seconds. The vision adapter always runs on CPU. Speculative decoding on
+  GPU returns `ErrSpecUnsupported` for gemma-4-class models.
 
 ## Examples
 
-Decode text (greedy unless `-temp` is set; `-topk` / `-topp` / `-seed`
-optional):
+Each example is a thin CLI over the public API. Decode text (greedy unless
+`-temp` is set; `-topk` / `-topp` / `-seed` optional):
 
 ```
 go run ./examples/decode -lib $LITERT_LIB -model model.litertlm -backend gpu \
@@ -155,6 +173,9 @@ go run ./examples/siginfo -lib $LITERT_LIB -model model.litertlm
 
 ## Limitations
 
+Most limits follow from the substrate: `.litertlm` models ship fully static
+graphs, and the runtime is a pinned prebuilt release.
+
 - Context is bounded by the model's KV-cache size (e.g. 4096 for gemma3-1b).
   Prefill covers the prompt by chunking across the model's prefill buckets.
 - Models are statically shaped; no KV-cache growth or tensor resize occurs.
@@ -162,9 +183,9 @@ go run ./examples/siginfo -lib $LITERT_LIB -model model.litertlm
   pass costs ~K× a decode step, so the speedup needs GPU.
 - The 2.1.5 runtime exposes no log-severity control; C-side INFO lines reach
   stderr.
-- Image and audio preprocessing are pure Go (gamma-space resize; hand-rolled
-  FFT mel spectrogram); validated qualitatively. `DecodeWAV` handles 16 kHz
-  mono PCM16/float32.
+- Image and audio preprocessing are pure Go (gamma-space resize; FFT mel
+  spectrogram); outputs are not bit-matched against a reference
+  implementation. `DecodeWAV` handles 16 kHz mono PCM16/float32.
 
 ## Build & test
 
