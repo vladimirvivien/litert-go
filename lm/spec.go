@@ -256,14 +256,14 @@ func elemCount(g sig, name string, out bool) int {
 
 // decodeSpeculative runs MTP speculative decoding on an embedding-input model
 // that has a verify signature and an mtp_drafter section.
-func decodeSpeculative(env litert.Environment, cm litert.CompiledModel, fileBytes []byte, pre prefiller, decode, verifySig sig, emb, ple *embedModel, prompt []int32, ngen int, stop map[int32]bool, accel litert.HwAccelerator, modelKey string, onToken func(int32)) ([]int, error) {
+func decodeSpeculative(env litert.Environment, cm litert.CompiledModel, fileBytes []byte, pre prefiller, decode, verifySig sig, emb, ple *embedModel, prompt []int32, ngen int, stop map[int32]bool, accel litert.HwAccelerator, modelKey, cacheDir string, onToken func(int32)) ([]int, error) {
 	if accel == litert.AccelGPU && sigHasInput(decode, "param_tensor") {
 		// The GPU single-buffer KV mode keeps the cache inside each compiled
 		// model's delegate; the drafter cannot share the base model's KV
 		// through bound buffers there.
 		return nil, fmt.Errorf("lm: speculative decoding on GPU is not supported for param_tensor models")
 	}
-	opts, err := gpuCompileOptions(accel, modelKey, "spec", true, sigHasInput(decode, "param_tensor"))
+	opts, err := gpuCompileOptions(accel, modelKey, cacheDir, "spec", true, sigHasInput(decode, "param_tensor"))
 	if err != nil {
 		return nil, err
 	}

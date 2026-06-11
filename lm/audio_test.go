@@ -1,6 +1,7 @@
 package lm
 
 import (
+	"context"
 	"math"
 	"os"
 	"testing"
@@ -16,7 +17,7 @@ func TestAudioEncodeSmoke(t *testing.T) {
 	if lib == "" || model == "" {
 		t.Skip("set LITERT_LIB and LITERT_LM_EMBED_MODEL (a gemma-4 .litertlm with audio)")
 	}
-	eng, err := Open(lib, model, envAccel())
+	eng, err := Open(context.Background(), model, WithLibDir(lib), WithAccelerator(envAccel()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +64,7 @@ func TestGenerateFromAudioRuns(t *testing.T) {
 	if lib == "" || model == "" {
 		t.Skip("set LITERT_LIB and LITERT_LM_EMBED_MODEL (a gemma-4 .litertlm with audio)")
 	}
-	eng, err := Open(lib, model, envAccel())
+	eng, err := Open(context.Background(), model, WithLibDir(lib), WithAccelerator(envAccel()))
 	if err != nil {
 		t.Fatal(err)
 	}

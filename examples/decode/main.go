@@ -6,6 +6,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -46,7 +47,8 @@ func main() {
 		fail(err)
 	}
 
-	eng, err := lm.Open(*libDir, *modelPath, accel)
+	eng, err := lm.Open(context.Background(), *modelPath,
+		lm.WithLibDir(*libDir), lm.WithAccelerator(accel))
 	if err != nil {
 		fail(err)
 	}

@@ -1,6 +1,8 @@
 package lm
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -59,7 +61,17 @@ func runModelMatrix(t *testing.T) {
 
 func matrixModel(t *testing.T, lib, modelPath string, accel litert.HwAccelerator) {
 	t.Helper()
-	eng, err := Open(lib, modelPath, accel)
+	opts := []Option{WithLibDir(lib), WithAccelerator(accel)}
+	if os.Getenv("LITERT_DECODE_STATS") != "" {
+		opts = append(opts, WithMetrics(func(s DecodeStats) {
+			if s.Tokens == 0 {
+				return
+			}
+			fmt.Fprintf(os.Stderr, "decode: %d tokens in %v (%.1f tok/s)\n",
+				s.Tokens, s.Decode.Round(time.Millisecond), s.TokensPerSecond())
+		}))
+	}
+	eng, err := Open(context.Background(), modelPath, opts...)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

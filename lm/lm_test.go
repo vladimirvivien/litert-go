@@ -1,11 +1,11 @@
 package lm_test
 
 import (
+	"context"
 	"os"
 	"strings"
 	"testing"
 
-	"github.com/vladimirvivien/litert-go/litert"
 	"github.com/vladimirvivien/litert-go/lm"
 )
 
@@ -20,7 +20,7 @@ func openEngine(t *testing.T) *lm.Engine {
 	if lib == "" || model == "" {
 		t.Skip("set LITERT_LIB and LITERT_LM_MODEL (a token-input chat .litertlm)")
 	}
-	eng, err := lm.Open(lib, model, litert.AccelCPU)
+	eng, err := lm.Open(context.Background(), model, lm.WithLibDir(lib))
 	if err != nil {
 		t.Fatal(err)
 	}

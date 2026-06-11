@@ -65,6 +65,21 @@ func WithLogf(f func(format string, args ...any)) Option {
 	return func(c *config) { c.logf = f }
 }
 
+// DefaultDir returns the directory a default-configured Fetch downloads into
+// for the current platform and DefaultVersion, without touching the network.
+// Callers use it to locate previously fetched libraries.
+func DefaultDir() (string, error) {
+	p, err := Platform()
+	if err != nil {
+		return "", err
+	}
+	base, err := os.UserCacheDir()
+	if err != nil {
+		return "", fmt.Errorf("libfetch: no cache dir: %w", err)
+	}
+	return filepath.Join(base, "litert-go", "lib", DefaultVersion, p), nil
+}
+
 // Platform returns the prebuilt bucket's platform name for the current
 // GOOS/GOARCH.
 func Platform() (string, error) {

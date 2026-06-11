@@ -42,7 +42,11 @@ import (
 	"github.com/vladimirvivien/litert-go/lm"
 )
 
-eng, err := lm.Open(libDir, "gemma3-1b-it-int4.litertlm", litert.AccelGPU)
+// Runtime libraries resolve from WithLibDir, then LITERT_LIB, then libfetch's
+// default download location; WithFetch("2.1.5") opts in to downloading them.
+eng, err := lm.Open(ctx, "gemma3-1b-it-int4.litertlm",
+	lm.WithAccelerator(litert.AccelGPU),
+	lm.WithMetrics(func(s lm.DecodeStats) { log.Printf("%.1f tok/s", s.TokensPerSecond()) }))
 defer eng.Close()
 
 out, _ := eng.Generate("What is the capital of France?", true /* chat */, lm.GenOptions{MaxTokens: 32})

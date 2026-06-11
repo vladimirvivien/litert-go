@@ -2,6 +2,7 @@ package lm
 
 import (
 	"bytes"
+	"context"
 	"image"
 	"image/color"
 	"image/png"
@@ -21,7 +22,7 @@ func TestVisionEncodeSmoke(t *testing.T) {
 	if lib == "" || model == "" {
 		t.Skip("set LITERT_LIB and LITERT_LM_EMBED_MODEL (a gemma-4 .litertlm with vision)")
 	}
-	eng, err := Open(lib, model, envAccel())
+	eng, err := Open(context.Background(), model, WithLibDir(lib), WithAccelerator(envAccel()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +77,7 @@ func TestGenerateFromImageSolidColor(t *testing.T) {
 	if lib == "" || model == "" {
 		t.Skip("set LITERT_LIB and LITERT_LM_EMBED_MODEL (a gemma-4 .litertlm with vision)")
 	}
-	eng, err := Open(lib, model, envAccel())
+	eng, err := Open(context.Background(), model, WithLibDir(lib), WithAccelerator(envAccel()))
 	if err != nil {
 		t.Fatal(err)
 	}

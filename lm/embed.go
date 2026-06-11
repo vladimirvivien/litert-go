@@ -2,7 +2,6 @@ package lm
 
 import (
 	"fmt"
-	"os"
 	"time"
 	"unsafe"
 
@@ -100,7 +99,7 @@ func (e *embedModel) close() {
 // decodeEmbeddingInput runs the gemma 3n/4 pipeline: allocate the double-banked
 // i8 KV cache, prefill all but the last prompt token through the shared embedder
 // stages, then greedily decode from the held-back token.
-func decodeEmbeddingInput(env litert.Environment, cm litert.CompiledModel, pre prefiller, decode sig, emb, ple *embedModel, prompt []int32, ngen int, stop map[int32]bool, smp *sampler, singleKV bool, onToken func(int32)) ([]int, error) {
+func decodeEmbeddingInput(env litert.Environment, cm litert.CompiledModel, pre prefiller, decode sig, emb, ple *embedModel, prompt []int32, ngen int, stop map[int32]bool, smp *sampler, singleKV bool, metrics func(DecodeStats), onToken func(int32)) ([]int, error) {
 	kv, err := allocKVBanks(env, cm, pre.max(), singleKV)
 	if err != nil {
 		return nil, err
@@ -137,11 +136,8 @@ func decodeEmbeddingInput(env litert.Environment, cm litert.CompiledModel, pre p
 		next = id
 		pos++
 	}
-	if os.Getenv("LITERT_DECODE_STATS") != "" && len(gen) > 0 {
-		el := time.Since(t0)
-		fmt.Fprintf(os.Stderr, "decode: %d tokens in %v (%.1f ms/token, %.1f tok/s)\n",
-			len(gen), el.Round(time.Millisecond), float64(el.Milliseconds())/float64(len(gen)),
-			float64(len(gen))/el.Seconds())
+	if metrics != nil {
+		metrics(DecodeStats{Tokens: len(gen), Decode: time.Since(t0)})
 	}
 	return gen, nil
 }

@@ -10,6 +10,7 @@ package lm
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"math"
 	"os"
@@ -66,33 +67,32 @@ func (h hfTokenizer) EOS() int32                 { return -1 }
 // Engine is a loaded, compiled model ready to generate text. It is not safe for
 // concurrent use.
 type Engine struct {
-	env        litert.Environment
-	model      litert.Model
-	cm         litert.CompiledModel
-	opts       litert.Options
-	tok        tokenizer
-	md         litertlm.Metadata
-	fileBytes  []byte
-	modelKey   string // per-model GPU program-cache namespace
-	pre        prefiller
-	decode     sig
-	verify     sig
-	haveVerify bool
-	accel      litert.HwAccelerator
-	emb, ple   *embedModel     // text + per-layer embedder stages, compiled once on first use
-	embOpts    litert.Options  // compile options backing emb/ple
-	vision     *visionPipeline // vision encoder + adapter, compiled once on first use
-	audio      *audioPipeline  // audio encoder + adapter, compiled once on first use
-	lastText   string          // most recent streamed output (GenerateStream/SendStream)
+	env         litert.Environment
+	model       litert.Model
+	cm          litert.CompiledModel
+	opts        litert.Options
+	tok         tokenizer
+	md          litertlm.Metadata
+	fileBytes   []byte
+	modelKey    string // per-model GPU program-cache namespace
+	pre         prefiller
+	decode      sig
+	verify      sig
+	haveVerify  bool
+	accel       litert.HwAccelerator
+	gpuCacheDir string
+	metrics     func(DecodeStats)
+	emb, ple    *embedModel     // text + per-layer embedder stages, compiled once on first use
+	embOpts     litert.Options  // compile options backing emb/ple
+	vision      *visionPipeline // vision encoder + adapter, compiled once on first use
+	audio       *audioPipeline  // audio encoder + adapter, compiled once on first use
+	lastText    string          // most recent streamed output (GenerateStream/SendStream)
 }
 
 // envOptions builds the LiteRt environment options: the runtime-library
 // directory, so accelerator plugins (e.g. libLiteRtWebGpuAccelerator) resolve
 // from libDir without having to be on the OS search path.
 func envOptions(libDir string) []litert.EnvOption {
-	if libDir == "" {
-		libDir = os.Getenv("LITERT_LIB")
-	}
 	if libDir == "" {
 		return nil
 	}
@@ -113,9 +113,9 @@ func modelCacheKey(modelPath string) string {
 	return key
 }
 
-// gpuCacheDir is a writable directory for persisting compiled GPU programs
-// across runs.
-func gpuCacheDir() string {
+// defaultGPUCacheDir is the default directory for persisting compiled GPU
+// programs across runs.
+func defaultGPUCacheDir() string {
 	base, err := os.UserCacheDir()
 	if err != nil {
 		base = os.TempDir()
@@ -141,7 +141,7 @@ func gpuCacheDir() string {
 // paramTensor marks models with an int32 param_tensor input (MTP models —
 // gemma 4); the C++ engine additionally puts param_tensor in the external set
 // and both patterns in buffer storage.
-func gpuCompileOptions(accel litert.HwAccelerator, modelKey, tag string, mainKV, paramTensor bool) (litert.Options, error) {
+func gpuCompileOptions(accel litert.HwAccelerator, modelKey, cacheDir, tag string, mainKV, paramTensor bool) (litert.Options, error) {
 	opts, err := litert.NewOptions(accel)
 	if err != nil {
 		return 0, err
@@ -149,7 +149,7 @@ func gpuCompileOptions(accel litert.HwAccelerator, modelKey, tag string, mainKV,
 	if accel != litert.AccelGPU {
 		return opts, nil
 	}
-	dir := gpuCacheDir()
+	dir := cacheDir
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return opts, nil
 	}
@@ -190,7 +190,7 @@ func gpuCompileOptions(accel litert.HwAccelerator, modelKey, tag string, mainKV,
 }
 
 func (e *Engine) compileOptions(tag string) (litert.Options, error) {
-	return gpuCompileOptions(e.accel, e.modelKey, tag,
+	return gpuCompileOptions(e.accel, e.modelKey, e.gpuCacheDir, tag,
 		tag == "main", sigHasInput(e.decode, "param_tensor"))
 }
 
@@ -200,20 +200,34 @@ func (e *Engine) singleKV() bool {
 	return e.accel == litert.AccelGPU && sigHasInput(e.decode, "param_tensor")
 }
 
-// Open loads libLiteRt from libDir (or the LITERT_LIB environment variable),
-// reads the .litertlm or .tflite model at modelPath, extracts its main
-// generation graph, tokenizer, and metadata, and compiles it for accel. Close
-// releases everything.
-func Open(libDir, modelPath string, accel litert.HwAccelerator) (*Engine, error) {
-	if err := litert.Load(libDir); err != nil {
-		return nil, err
+// Open reads the .litertlm or .tflite model at modelPath, extracts its main
+// generation graph, tokenizer, and metadata, and compiles it for the
+// configured accelerator (CPU by default). The runtime libraries resolve from
+// WithLibDir, then the LITERT_LIB environment variable, then libfetch's
+// default download location; WithFetch opts in to downloading them. Close
+// releases everything. ctx covers Open itself (including an opted-in
+// download), not later generation calls.
+func Open(ctx context.Context, modelPath string, options ...Option) (*Engine, error) {
+	var c openConfig
+	c.accel = litert.AccelCPU
+	for _, o := range options {
+		o(&c)
 	}
-	opts := envOptions(libDir)
-	env, err := litert.NewEnvironment(opts...)
+	libDir, err := resolveLibDir(ctx, &c)
 	if err != nil {
 		return nil, err
 	}
-	e := &Engine{env: env, accel: accel}
+	if err := litert.Load(libDir); err != nil {
+		return nil, err
+	}
+	if c.gpuCacheDir == "" {
+		c.gpuCacheDir = defaultGPUCacheDir()
+	}
+	env, err := litert.NewEnvironment(envOptions(libDir)...)
+	if err != nil {
+		return nil, err
+	}
+	e := &Engine{env: env, accel: c.accel, gpuCacheDir: c.gpuCacheDir, metrics: c.metrics}
 	ok := false
 	defer func() {
 		if !ok {
@@ -462,15 +476,15 @@ func (e *Engine) generate(prompt []int32, o GenOptions, onToken func(int32)) ([]
 		if err != nil {
 			return nil, err
 		}
-		return decodeSpeculative(e.env, e.cm, e.fileBytes, e.pre, e.decode, e.verify, emb, ple, prompt, o.MaxTokens, stop, e.accel, e.modelKey, onToken)
+		return decodeSpeculative(e.env, e.cm, e.fileBytes, e.pre, e.decode, e.verify, emb, ple, prompt, o.MaxTokens, stop, e.accel, e.modelKey, e.gpuCacheDir, onToken)
 	case sigHasInput(e.decode, "embeddings"):
 		emb, ple, err := e.ensureEmbedders()
 		if err != nil {
 			return nil, err
 		}
-		return decodeEmbeddingInput(e.env, e.cm, e.pre, e.decode, emb, ple, prompt, o.MaxTokens, stop, smp, e.singleKV(), onToken)
+		return decodeEmbeddingInput(e.env, e.cm, e.pre, e.decode, emb, ple, prompt, o.MaxTokens, stop, smp, e.singleKV(), e.metrics, onToken)
 	default:
-		return decodeTokenInput(e.env, e.cm, e.pre, e.decode, prompt, o.MaxTokens, stop, smp, onToken)
+		return decodeTokenInput(e.env, e.cm, e.pre, e.decode, prompt, o.MaxTokens, stop, smp, e.metrics, onToken)
 	}
 }
 
@@ -1083,7 +1097,7 @@ func stopSet(tok tokenizer, md litertlm.Metadata) map[int32]bool {
 // decodeTokenInput runs the static token-input pipeline (gemma3, qwen3, …):
 // allocate the KV cache once, prefill all but the last prompt token, then
 // decode from the held-back token.
-func decodeTokenInput(env litert.Environment, cm litert.CompiledModel, pre prefiller, decode sig, prompt []int32, ngen int, stop map[int32]bool, smp *sampler, onToken func(int32)) ([]int, error) {
+func decodeTokenInput(env litert.Environment, cm litert.CompiledModel, pre prefiller, decode sig, prompt []int32, ngen int, stop map[int32]bool, smp *sampler, metrics func(DecodeStats), onToken func(int32)) ([]int, error) {
 	kv, err := allocKVBanks(env, cm, pre.max(), false)
 	if err != nil {
 		return nil, err
@@ -1120,11 +1134,8 @@ func decodeTokenInput(env litert.Environment, cm litert.CompiledModel, pre prefi
 		next = id
 		pos++
 	}
-	if os.Getenv("LITERT_DECODE_STATS") != "" && len(gen) > 0 {
-		el := time.Since(t0)
-		fmt.Fprintf(os.Stderr, "decode: %d tokens in %v (%.1f ms/token, %.1f tok/s)\n",
-			len(gen), el.Round(time.Millisecond), float64(el.Milliseconds())/float64(len(gen)),
-			float64(len(gen))/el.Seconds())
+	if metrics != nil {
+		metrics(DecodeStats{Tokens: len(gen), Decode: time.Since(t0)})
 	}
 	return gen, nil
 }
