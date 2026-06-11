@@ -47,7 +47,8 @@ func main() {
 		fail(err)
 	}
 
-	eng, err := lm.Open(context.Background(), *modelPath,
+	ctx := context.Background()
+	eng, err := lm.Open(ctx, *modelPath,
 		lm.WithLibDir(*libDir), lm.WithAccelerator(accel))
 	if err != nil {
 		fail(err)
@@ -66,12 +67,12 @@ func main() {
 
 	switch {
 	case *repl:
-		err = runRepl(eng, o)
+		err = runRepl(ctx, eng, o)
 	case *image != "":
 		var data []byte
 		if data, err = os.ReadFile(*image); err == nil {
 			var out string
-			if out, err = eng.GenerateFromImage(*text, data, 0, o); err == nil {
+			if out, err = eng.GenerateFromImage(ctx, *text, data, 0, o); err == nil {
 				fmt.Printf("prompt: %q\noutput: %s\n", *text, out)
 			}
 		}
@@ -81,7 +82,7 @@ func main() {
 			var pcm []float32
 			if pcm, err = audio.DecodeWAV(data); err == nil {
 				var out string
-				if out, err = eng.GenerateFromAudio(*text, pcm, o); err == nil {
+				if out, err = eng.GenerateFromAudio(ctx, *text, pcm, o); err == nil {
 					fmt.Printf("prompt: %q\noutput: %s\n", *text, out)
 				}
 			}
@@ -90,13 +91,13 @@ func main() {
 		var ids []int32
 		if ids, err = parseIDs(*promptCSV); err == nil {
 			var gen []int
-			if gen, err = eng.GenerateIDs(ids, o); err == nil {
+			if gen, err = eng.GenerateIDs(ctx, ids, o); err == nil {
 				fmt.Printf("prompt=%v\noutput tokens=%v\n", ids, gen)
 			}
 		}
 	default:
 		fmt.Printf("prompt: %q\noutput: ", *text)
-		_, err = eng.GenerateStream(*text, *chat, o, func(p string) { fmt.Print(p) })
+		_, err = eng.GenerateStream(ctx, *text, *chat, o, func(p string) { fmt.Print(p) })
 		fmt.Println()
 	}
 	if err != nil {
@@ -106,7 +107,7 @@ func main() {
 
 // runRepl is an interactive multi-turn chat loop: each stdin line is a user
 // turn; the reply is printed and kept for context.
-func runRepl(eng *lm.Engine, o lm.GenOptions) error {
+func runRepl(ctx context.Context, eng *lm.Engine, o lm.GenOptions) error {
 	chat, err := eng.NewConversation(o)
 	if err != nil {
 		return err
@@ -121,7 +122,7 @@ func runRepl(eng *lm.Engine, o lm.GenOptions) error {
 			fmt.Fprint(os.Stderr, "> ")
 			continue
 		}
-		if _, err := chat.SendStream(line, func(p string) { fmt.Print(p) }); err != nil {
+		if _, err := chat.SendStream(ctx, line, func(p string) { fmt.Print(p) }); err != nil {
 			return err
 		}
 		fmt.Println()

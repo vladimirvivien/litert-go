@@ -49,26 +49,27 @@ eng, err := lm.Open(ctx, "gemma3-1b-it-int4.litertlm",
 	lm.WithMetrics(func(s lm.DecodeStats) { log.Printf("%.1f tok/s", s.TokensPerSecond()) }))
 defer eng.Close()
 
-out, _ := eng.Generate("What is the capital of France?", true /* chat */, lm.GenOptions{MaxTokens: 32})
+out, _ := eng.Generate(ctx, "What is the capital of France?", true /* chat */, lm.GenOptions{MaxTokens: 32})
 
 // Streaming (Generate/Send have token-by-token variants):
-_, _ = eng.GenerateStream("…", true, lm.GenOptions{MaxTokens: 64}, func(piece string) { fmt.Print(piece) })
+_, _ = eng.GenerateStream(ctx, "…", true, lm.GenOptions{MaxTokens: 64}, func(piece string) { fmt.Print(piece) })
 
 // Multi-turn with a KV-reuse session; GenOptions.System steers the assistant:
 conv, _ := eng.NewConversation(lm.GenOptions{MaxTokens: 64, Temp: 0.8, TopK: 40,
 	System: "You are a terse assistant. Answer in one sentence."})
 defer conv.Close()
-reply, _ := conv.Send("My name is Vlad.")
-reply, _ = conv.SendStream("What is my name?", func(piece string) { fmt.Print(piece) })
+reply, _ := conv.Send(ctx, "My name is Vlad.")
+reply, _ = conv.SendStream(ctx, "What is my name?", func(piece string) { fmt.Print(piece) })
 
 // Vision/audio (gemma-4): generate text from a prompt + image/clip; mark the
 // position with <start_of_image> / <start_of_audio>:
 img, _ := os.ReadFile("photo.jpg")
-caption, _ := eng.GenerateFromImage("<start_of_image>Describe this image.", img, 0 /* budget */, lm.GenOptions{MaxTokens: 64})
+caption, _ := eng.GenerateFromImage(ctx, "<start_of_image>Describe this image.", img, 0 /* budget */, lm.GenOptions{MaxTokens: 64})
 pcm, _ := audio.DecodeWAV(wavBytes) // 16kHz mono
-answer, _ := eng.GenerateFromAudio("<start_of_audio>What do you hear?", pcm, lm.GenOptions{MaxTokens: 64})
+answer, _ := eng.GenerateFromAudio(ctx, "<start_of_audio>What do you hear?", pcm, lm.GenOptions{MaxTokens: 64})
 ```
 
+Cancelling ctx stops generation between decode steps with `context.Canceled`.
 `GenOptions.Spec` enables MTP speculative decoding when the model supports it
 (`eng.SupportsSpec()`). Both tokenizer families embedded in `.litertlm`
 containers are supported: SentencePiece (including HF-converted raw-space

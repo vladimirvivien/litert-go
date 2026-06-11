@@ -77,7 +77,7 @@ func TestGenerateFromAudioRuns(t *testing.T) {
 	for i := range pcm {
 		pcm[i] = float32(0.5 * math.Sin(2*math.Pi*440*float64(i)/audio.SampleRate))
 	}
-	out, err := eng.GenerateFromAudio("<start_of_audio>Describe what you hear in one sentence.", pcm, GenOptions{MaxTokens: 32})
+	out, err := eng.GenerateFromAudio(context.Background(), "<start_of_audio>Describe what you hear in one sentence.", pcm, GenOptions{MaxTokens: 32})
 	if err != nil {
 		t.Fatal(err)
 	}

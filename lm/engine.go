@@ -414,7 +414,7 @@ type GenOptions struct {
 
 // Generate completes prompt and returns the generated text. When chat is true
 // the prompt is wrapped in the model's chat template.
-func (e *Engine) Generate(prompt string, chat bool, o GenOptions) (string, error) {
+func (e *Engine) Generate(ctx context.Context, prompt string, chat bool, o GenOptions) (string, error) {
 	if e.tok == nil {
 		return "", fmt.Errorf("lm: model has no tokenizer; use GenerateIDs")
 	}
@@ -422,7 +422,7 @@ func (e *Engine) Generate(prompt string, chat bool, o GenOptions) (string, error
 	if err != nil {
 		return "", err
 	}
-	gen, err := e.generate(ids, o, nil)
+	gen, err := e.generate(ctx, ids, o, nil)
 	if err != nil {
 		return "", err
 	}
@@ -431,13 +431,13 @@ func (e *Engine) Generate(prompt string, chat bool, o GenOptions) (string, error
 
 // GenerateIDs runs the model on explicit prompt token IDs and returns the
 // generated token IDs. For models without a tokenizer.
-func (e *Engine) GenerateIDs(prompt []int32, o GenOptions) ([]int, error) {
-	return e.generate(prompt, o, nil)
+func (e *Engine) GenerateIDs(ctx context.Context, prompt []int32, o GenOptions) ([]int, error) {
+	return e.generate(ctx, prompt, o, nil)
 }
 
 // GenerateStream is Generate with incremental output: onPiece is called with
 // each newly decoded text fragment as it is produced. It returns the full text.
-func (e *Engine) GenerateStream(prompt string, chat bool, o GenOptions, onPiece func(string)) (string, error) {
+func (e *Engine) GenerateStream(ctx context.Context, prompt string, chat bool, o GenOptions, onPiece func(string)) (string, error) {
 	if e.tok == nil {
 		return "", fmt.Errorf("lm: model has no tokenizer; use GenerateIDs")
 	}
@@ -445,7 +445,7 @@ func (e *Engine) GenerateStream(prompt string, chat bool, o GenOptions, onPiece 
 	if err != nil {
 		return "", err
 	}
-	_, err = e.generate(ids, o, e.streamer(onPiece))
+	_, err = e.generate(ctx, ids, o, e.streamer(onPiece))
 	if err != nil {
 		return "", err
 	}
@@ -467,7 +467,7 @@ func (e *Engine) streamer(onPiece func(string)) func(int32) {
 	}
 }
 
-func (e *Engine) generate(prompt []int32, o GenOptions, onToken func(int32)) ([]int, error) {
+func (e *Engine) generate(ctx context.Context, prompt []int32, o GenOptions, onToken func(int32)) ([]int, error) {
 	smp := newSampler(o.Temp, o.TopK, o.TopP, o.Seed)
 	stop := stopSet(e.tok, e.md)
 	switch {
@@ -476,15 +476,15 @@ func (e *Engine) generate(prompt []int32, o GenOptions, onToken func(int32)) ([]
 		if err != nil {
 			return nil, err
 		}
-		return decodeSpeculative(e.env, e.cm, e.fileBytes, e.pre, e.decode, e.verify, emb, ple, prompt, o.MaxTokens, stop, e.accel, e.modelKey, e.gpuCacheDir, onToken)
+		return decodeSpeculative(ctx, e.env, e.cm, e.fileBytes, e.pre, e.decode, e.verify, emb, ple, prompt, o.MaxTokens, stop, e.accel, e.modelKey, e.gpuCacheDir, onToken)
 	case sigHasInput(e.decode, "embeddings"):
 		emb, ple, err := e.ensureEmbedders()
 		if err != nil {
 			return nil, err
 		}
-		return decodeEmbeddingInput(e.env, e.cm, e.pre, e.decode, emb, ple, prompt, o.MaxTokens, stop, smp, e.singleKV(), e.metrics, onToken)
+		return decodeEmbeddingInput(ctx, e.env, e.cm, e.pre, e.decode, emb, ple, prompt, o.MaxTokens, stop, smp, e.singleKV(), e.metrics, onToken)
 	default:
-		return decodeTokenInput(e.env, e.cm, e.pre, e.decode, prompt, o.MaxTokens, stop, smp, e.metrics, onToken)
+		return decodeTokenInput(ctx, e.env, e.cm, e.pre, e.decode, prompt, o.MaxTokens, stop, smp, e.metrics, onToken)
 	}
 }
 
@@ -520,28 +520,28 @@ func (c *Chat) Close() {}
 
 // Send adds a user message and returns the model's reply, retaining both for
 // context on subsequent calls.
-func (c *Chat) Send(userText string) (string, error) {
-	return c.send(userText, nil)
+func (c *Chat) Send(ctx context.Context, userText string) (string, error) {
+	return c.send(ctx, userText, nil)
 }
 
 // SendStream is Send with incremental output: onPiece is called with each newly
 // decoded fragment of the reply as it is produced.
-func (c *Chat) SendStream(userText string, onPiece func(string)) (string, error) {
-	return c.send(userText, onPiece)
+func (c *Chat) SendStream(ctx context.Context, userText string, onPiece func(string)) (string, error) {
+	return c.send(ctx, userText, onPiece)
 }
 
-func (c *Chat) send(userText string, onPiece func(string)) (string, error) {
+func (c *Chat) send(ctx context.Context, userText string, onPiece func(string)) (string, error) {
 	c.hist = append(c.hist, turn{role: "user", text: userText})
 	prompt := buildConversation(c.e.tok, c.e.md, c.tpl, c.hist)
 	var reply string
 	if onPiece != nil {
-		_, err := c.e.generate(prompt, c.o, c.e.streamer(onPiece))
+		_, err := c.e.generate(ctx, prompt, c.o, c.e.streamer(onPiece))
 		if err != nil {
 			return "", err
 		}
 		reply = c.e.lastText
 	} else {
-		gen, err := c.e.generate(prompt, c.o, nil)
+		gen, err := c.e.generate(ctx, prompt, c.o, nil)
 		if err != nil {
 			return "", err
 		}
@@ -554,8 +554,8 @@ func (c *Chat) send(userText string, onPiece func(string)) (string, error) {
 // Conversation is a multi-turn chat session. Both Chat (re-prefills the history
 // each turn) and Session (reuses the KV cache across turns) satisfy it.
 type Conversation interface {
-	Send(userText string) (string, error)
-	SendStream(userText string, onPiece func(string)) (string, error)
+	Send(ctx context.Context, userText string) (string, error)
+	SendStream(ctx context.Context, userText string, onPiece func(string)) (string, error)
 	Close()
 }
 
@@ -628,14 +628,16 @@ func (s *Session) Close() {
 }
 
 // Send adds a user message and returns the reply.
-func (s *Session) Send(userText string) (string, error) { return s.send(userText, nil) }
-
-// SendStream is Send with incremental output.
-func (s *Session) SendStream(userText string, onPiece func(string)) (string, error) {
-	return s.send(userText, onPiece)
+func (s *Session) Send(ctx context.Context, userText string) (string, error) {
+	return s.send(ctx, userText, nil)
 }
 
-func (s *Session) send(userText string, onPiece func(string)) (string, error) {
+// SendStream is Send with incremental output.
+func (s *Session) SendStream(ctx context.Context, userText string, onPiece func(string)) (string, error) {
+	return s.send(ctx, userText, onPiece)
+}
+
+func (s *Session) send(ctx context.Context, userText string, onPiece func(string)) (string, error) {
 	// Render the new turn. The first turn carries the start token; later turns
 	// first close the previous model turn with its suffix.
 	render := s.tpl.User.Prefix + userText + s.tpl.User.Suffix + s.tpl.Model.Prefix
@@ -659,7 +661,7 @@ func (s *Session) send(userText string, onPiece func(string)) (string, error) {
 	// held-back token's decode logits start the reply.
 	n := len(ids)
 	if n > 1 {
-		if err := prefillTokenRun(s.e.env, s.e.cm, s.e.pre, s.kv, ids[:n-1], s.pos); err != nil {
+		if err := prefillTokenRun(ctx, s.e.env, s.e.cm, s.e.pre, s.kv, ids[:n-1], s.pos); err != nil {
 			return "", err
 		}
 	}
@@ -676,6 +678,9 @@ func (s *Session) send(userText string, onPiece func(string)) (string, error) {
 	}
 	var gen []int
 	for g := 0; g < s.o.MaxTokens; g++ {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		if s.stop[id] {
 			break
 		}
@@ -947,9 +952,12 @@ func (k *kvBanks) close() {
 
 // prefillTokenRun ingests ids into the KV cache starting at position start,
 // chunking across prefill buckets for prompts longer than one bucket.
-func prefillTokenRun(env litert.Environment, cm litert.CompiledModel, pre prefiller, kv *kvBanks, ids []int32, start int) error {
+func prefillTokenRun(ctx context.Context, env litert.Environment, cm litert.CompiledModel, pre prefiller, kv *kvBanks, ids []int32, start int) error {
 	off := 0
 	for _, c := range pre.plan(len(ids)) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := prefillStep(env, cm, pre.sig[c.bucket], kv, ids[off:off+c.take], start+off); err != nil {
 			return err
 		}
@@ -1097,7 +1105,7 @@ func stopSet(tok tokenizer, md litertlm.Metadata) map[int32]bool {
 // decodeTokenInput runs the static token-input pipeline (gemma3, qwen3, …):
 // allocate the KV cache once, prefill all but the last prompt token, then
 // decode from the held-back token.
-func decodeTokenInput(env litert.Environment, cm litert.CompiledModel, pre prefiller, decode sig, prompt []int32, ngen int, stop map[int32]bool, smp *sampler, metrics func(DecodeStats), onToken func(int32)) ([]int, error) {
+func decodeTokenInput(ctx context.Context, env litert.Environment, cm litert.CompiledModel, pre prefiller, decode sig, prompt []int32, ngen int, stop map[int32]bool, smp *sampler, metrics func(DecodeStats), onToken func(int32)) ([]int, error) {
 	kv, err := allocKVBanks(env, cm, pre.max(), false)
 	if err != nil {
 		return nil, err
@@ -1105,7 +1113,7 @@ func decodeTokenInput(env litert.Environment, cm litert.CompiledModel, pre prefi
 	defer kv.close()
 
 	p := len(prompt) - 1
-	if err := prefillTokenRun(env, cm, pre, kv, prompt[:p], 0); err != nil {
+	if err := prefillTokenRun(ctx, env, cm, pre, kv, prompt[:p], 0); err != nil {
 		return nil, fmt.Errorf("prefill: %w", err)
 	}
 
@@ -1120,6 +1128,9 @@ func decodeTokenInput(env litert.Environment, cm litert.CompiledModel, pre prefi
 	var gen []int
 	t0 := time.Now()
 	for g := 0; g < ngen; g++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		id, err := dec.step(next, pos)
 		if err != nil {
 			return nil, fmt.Errorf("decode step %d: %w", g, err)

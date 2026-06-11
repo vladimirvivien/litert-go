@@ -1,6 +1,7 @@
 package lm
 
 import (
+	"context"
 	"fmt"
 	"os"
 
@@ -256,7 +257,7 @@ func elemCount(g sig, name string, out bool) int {
 
 // decodeSpeculative runs MTP speculative decoding on an embedding-input model
 // that has a verify signature and an mtp_drafter section.
-func decodeSpeculative(env litert.Environment, cm litert.CompiledModel, fileBytes []byte, pre prefiller, decode, verifySig sig, emb, ple *embedModel, prompt []int32, ngen int, stop map[int32]bool, accel litert.HwAccelerator, modelKey, cacheDir string, onToken func(int32)) ([]int, error) {
+func decodeSpeculative(ctx context.Context, env litert.Environment, cm litert.CompiledModel, fileBytes []byte, pre prefiller, decode, verifySig sig, emb, ple *embedModel, prompt []int32, ngen int, stop map[int32]bool, accel litert.HwAccelerator, modelKey, cacheDir string, onToken func(int32)) ([]int, error) {
 	if accel == litert.AccelGPU && sigHasInput(decode, "param_tensor") {
 		// The GPU single-buffer KV mode keeps the cache inside each compiled
 		// model's delegate; the drafter cannot share the base model's KV
@@ -281,7 +282,7 @@ func decodeSpeculative(env litert.Environment, cm litert.CompiledModel, fileByte
 	defer kv.close()
 
 	p := len(prompt) - 1
-	if err := prefillEmbedRun(env, cm, pre, kv, emb, ple, prompt[:p], 0); err != nil {
+	if err := prefillEmbedRun(ctx, env, cm, pre, kv, emb, ple, prompt[:p], 0); err != nil {
 		return nil, fmt.Errorf("prefill: %w", err)
 	}
 
@@ -313,6 +314,9 @@ func decodeSpeculative(env litert.Environment, cm litert.CompiledModel, fileByte
 		}
 	}()
 	for len(gen) < ngen {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		passes++
 		tokenID, act, err := dec.stepAct(pending, pos)
 		if err != nil {

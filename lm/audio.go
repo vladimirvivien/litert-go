@@ -1,6 +1,7 @@
 package lm
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/vladimirvivien/litert-go/audio"
@@ -180,7 +181,7 @@ func (a *audioPipeline) encode(env litert.Environment, mel *audio.MelSpectrogram
 // clip given as 16 kHz mono PCM samples. The prompt must contain
 // "<start_of_audio>" where the audio belongs. Embedding-input (gemma 3n/4) models
 // with an audio stack only.
-func (e *Engine) GenerateFromAudio(prompt string, pcm []float32, o GenOptions) (string, error) {
+func (e *Engine) GenerateFromAudio(ctx context.Context, prompt string, pcm []float32, o GenOptions) (string, error) {
 	if err := e.requireMultiModal("GenerateFromAudio"); err != nil {
 		return "", err
 	}
@@ -193,7 +194,7 @@ func (e *Engine) GenerateFromAudio(prompt string, pcm []float32, o GenOptions) (
 	if err != nil {
 		return "", err
 	}
-	return e.generateModal(prompt, "<start_of_audio>", "<start_of_audio>", "<end_of_audio>", audioSoftToken, mm, tReal, o)
+	return e.generateModal(ctx, prompt, "<start_of_audio>", "<start_of_audio>", "<end_of_audio>", audioSoftToken, mm, tReal, o)
 }
 
 func (a *audioPipeline) close() {

@@ -1,6 +1,7 @@
 package lm
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strconv"
@@ -255,7 +256,7 @@ func (v *visionPipeline) close() {
 // The prompt must contain "<start_of_image>" where the image belongs. budget is
 // the visual-token budget (0 = default). Embedding-input (gemma 3n/4) models with
 // a vision stack only.
-func (e *Engine) GenerateFromImage(prompt string, imageData []byte, budget int, o GenOptions) (string, error) {
+func (e *Engine) GenerateFromImage(ctx context.Context, prompt string, imageData []byte, budget int, o GenOptions) (string, error) {
 	if err := e.requireMultiModal("GenerateFromImage"); err != nil {
 		return "", err
 	}
@@ -271,7 +272,7 @@ func (e *Engine) GenerateFromImage(prompt string, imageData []byte, budget int, 
 	if err != nil {
 		return "", err
 	}
-	return e.generateModal(prompt, "<start_of_image>", "<start_of_image>", "<end_of_image>", visionSoftToken, mm, tReal, o)
+	return e.generateModal(ctx, prompt, "<start_of_image>", "<start_of_image>", "<end_of_image>", visionSoftToken, mm, tReal, o)
 }
 
 // readBytes copies the first n bytes of a buffer out to Go memory.

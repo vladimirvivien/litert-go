@@ -1,6 +1,7 @@
 package lm
 
 import (
+	"context"
 	"fmt"
 	"time"
 	"unsafe"
@@ -99,7 +100,7 @@ func (e *embedModel) close() {
 // decodeEmbeddingInput runs the gemma 3n/4 pipeline: allocate the double-banked
 // i8 KV cache, prefill all but the last prompt token through the shared embedder
 // stages, then greedily decode from the held-back token.
-func decodeEmbeddingInput(env litert.Environment, cm litert.CompiledModel, pre prefiller, decode sig, emb, ple *embedModel, prompt []int32, ngen int, stop map[int32]bool, smp *sampler, singleKV bool, metrics func(DecodeStats), onToken func(int32)) ([]int, error) {
+func decodeEmbeddingInput(ctx context.Context, env litert.Environment, cm litert.CompiledModel, pre prefiller, decode sig, emb, ple *embedModel, prompt []int32, ngen int, stop map[int32]bool, smp *sampler, singleKV bool, metrics func(DecodeStats), onToken func(int32)) ([]int, error) {
 	kv, err := allocKVBanks(env, cm, pre.max(), singleKV)
 	if err != nil {
 		return nil, err
@@ -107,7 +108,7 @@ func decodeEmbeddingInput(env litert.Environment, cm litert.CompiledModel, pre p
 	defer kv.close()
 
 	p := len(prompt) - 1
-	if err := prefillEmbedRun(env, cm, pre, kv, emb, ple, prompt[:p], 0); err != nil {
+	if err := prefillEmbedRun(ctx, env, cm, pre, kv, emb, ple, prompt[:p], 0); err != nil {
 		return nil, fmt.Errorf("prefill: %w", err)
 	}
 
@@ -122,6 +123,9 @@ func decodeEmbeddingInput(env litert.Environment, cm litert.CompiledModel, pre p
 	var gen []int
 	t0 := time.Now()
 	for g := 0; g < ngen; g++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		id, err := dec.step(next, pos)
 		if err != nil {
 			return nil, fmt.Errorf("decode step %d: %w", g, err)
@@ -264,9 +268,12 @@ func prefillEmbedFill(env litert.Environment, cm litert.CompiledModel, g sig, kv
 
 // prefillEmbedRun ingests ids into the KV cache starting at position start,
 // chunking across prefill buckets for prompts longer than one bucket.
-func prefillEmbedRun(env litert.Environment, cm litert.CompiledModel, pre prefiller, kv *kvBanks, emb, ple *embedModel, ids []int32, start int) error {
+func prefillEmbedRun(ctx context.Context, env litert.Environment, cm litert.CompiledModel, pre prefiller, kv *kvBanks, emb, ple *embedModel, ids []int32, start int) error {
 	off := 0
 	for _, c := range pre.plan(len(ids)) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := prefillEmbed(env, cm, pre.sig[c.bucket], kv, emb, ple, ids[off:off+c.take], start+off); err != nil {
 			return err
 		}
@@ -278,7 +285,7 @@ func prefillEmbedRun(env litert.Environment, cm litert.CompiledModel, pre prefil
 // prefillEmbedDataRun ingests pre-computed text (and per-layer) embeddings for n
 // tokens into the KV cache at start, chunking across prefill buckets. text is
 // [n*H], perLayer is [n*L] (or empty).
-func prefillEmbedDataRun(env litert.Environment, cm litert.CompiledModel, pre prefiller, kv *kvBanks, text, perLayer []float32, n, start int) error {
+func prefillEmbedDataRun(ctx context.Context, env litert.Environment, cm litert.CompiledModel, pre prefiller, kv *kvBanks, text, perLayer []float32, n, start int) error {
 	if n == 0 {
 		return nil
 	}
@@ -289,6 +296,9 @@ func prefillEmbedDataRun(env litert.Environment, cm litert.CompiledModel, pre pr
 	}
 	off := 0
 	for _, c := range pre.plan(n) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		t := text[off*h : (off+c.take)*h]
 		var pl []float32
 		if l > 0 {
@@ -528,14 +538,16 @@ func (s *embedSession) Close() {
 }
 
 // Send adds a user message and returns the reply.
-func (s *embedSession) Send(userText string) (string, error) { return s.send(userText, nil) }
-
-// SendStream is Send with incremental output.
-func (s *embedSession) SendStream(userText string, onPiece func(string)) (string, error) {
-	return s.send(userText, onPiece)
+func (s *embedSession) Send(ctx context.Context, userText string) (string, error) {
+	return s.send(ctx, userText, nil)
 }
 
-func (s *embedSession) send(userText string, onPiece func(string)) (string, error) {
+// SendStream is Send with incremental output.
+func (s *embedSession) SendStream(ctx context.Context, userText string, onPiece func(string)) (string, error) {
+	return s.send(ctx, userText, onPiece)
+}
+
+func (s *embedSession) send(ctx context.Context, userText string, onPiece func(string)) (string, error) {
 	// Render the new turn. The first turn carries the start token; later turns
 	// first close the previous model turn with its suffix.
 	render := s.tpl.User.Prefix + userText + s.tpl.User.Suffix + s.tpl.Model.Prefix
@@ -556,7 +568,7 @@ func (s *embedSession) send(userText string, onPiece func(string)) (string, erro
 	// graph then feeds the held-back token, whose logits start the reply.
 	p := len(ids) - 1
 	if p > 0 {
-		if err := prefillEmbedRun(s.e.env, s.e.cm, s.e.pre, s.kv, s.e.emb, s.e.ple, ids[:p], s.pos); err != nil {
+		if err := prefillEmbedRun(ctx, s.e.env, s.e.cm, s.e.pre, s.kv, s.e.emb, s.e.ple, ids[:p], s.pos); err != nil {
 			return "", fmt.Errorf("prefill: %w", err)
 		}
 	}
@@ -576,6 +588,9 @@ func (s *embedSession) send(userText string, onPiece func(string)) (string, erro
 	}
 	var gen []int
 	for g := 0; g < s.o.MaxTokens; g++ {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		if s.stop[id] {
 			break
 		}

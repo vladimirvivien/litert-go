@@ -97,7 +97,7 @@ func TestGenerateFromImageSolidColor(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	out, err := eng.GenerateFromImage(
+	out, err := eng.GenerateFromImage(context.Background(),
 		"<start_of_image>What is the dominant color in this image? Answer in one word.",
 		buf.Bytes(), 70, GenOptions{MaxTokens: 16})
 	if err != nil {

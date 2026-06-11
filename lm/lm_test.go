@@ -2,6 +2,7 @@ package lm_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -32,14 +33,14 @@ func openEngine(t *testing.T) *lm.Engine {
 func TestGenerateGreedyDeterministic(t *testing.T) {
 	eng := openEngine(t)
 	o := lm.GenOptions{MaxTokens: 16}
-	a, err := eng.Generate("The capital of France is", false, o)
+	a, err := eng.Generate(context.Background(), "The capital of France is", false, o)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if a == "" {
 		t.Fatal("empty greedy output")
 	}
-	b, err := eng.Generate("The capital of France is", false, o)
+	b, err := eng.Generate(context.Background(), "The capital of France is", false, o)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,12 +53,12 @@ func TestGenerateGreedyDeterministic(t *testing.T) {
 func TestStreamMatchesGenerate(t *testing.T) {
 	eng := openEngine(t)
 	o := lm.GenOptions{MaxTokens: 16}
-	full, err := eng.Generate("The capital of France is", false, o)
+	full, err := eng.Generate(context.Background(), "The capital of France is", false, o)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var sb strings.Builder
-	ret, err := eng.GenerateStream("The capital of France is", false, o, func(p string) { sb.WriteString(p) })
+	ret, err := eng.GenerateStream(context.Background(), "The capital of France is", false, o, func(p string) { sb.WriteString(p) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +78,7 @@ func TestSessionMatchesGenerate(t *testing.T) {
 		t.Skip("model has no chat template")
 	}
 	o := lm.GenOptions{MaxTokens: 16}
-	want, err := eng.Generate("Name one primary color.", true, o)
+	want, err := eng.Generate(context.Background(), "Name one primary color.", true, o)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +87,7 @@ func TestSessionMatchesGenerate(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sess.Close()
-	got, err := sess.Send("Name one primary color.")
+	got, err := sess.Send(context.Background(), "Name one primary color.")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,14 +116,14 @@ func TestLongContextChunked(t *testing.T) {
 	prompt := b.String()
 
 	o := lm.GenOptions{MaxTokens: 16}
-	out, err := eng.Generate(prompt, true, o)
+	out, err := eng.Generate(context.Background(), prompt, true, o)
 	if err != nil {
 		t.Fatalf("long prompt failed (chunked prefill should handle it): %v", err)
 	}
 	if out == "" {
 		t.Fatal("empty reply on long prompt")
 	}
-	again, err := eng.Generate(prompt, true, o)
+	again, err := eng.Generate(context.Background(), prompt, true, o)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,11 +143,11 @@ func TestSystemPromptSteers(t *testing.T) {
 		t.Skip("model has no chat template")
 	}
 	const q = "What color is the sky on a clear day?"
-	base, err := eng.Generate(q, true, lm.GenOptions{MaxTokens: 24})
+	base, err := eng.Generate(context.Background(), q, true, lm.GenOptions{MaxTokens: 24})
 	if err != nil {
 		t.Fatal(err)
 	}
-	steered, err := eng.Generate(q, true, lm.GenOptions{
+	steered, err := eng.Generate(context.Background(), q, true, lm.GenOptions{
 		MaxTokens: 24,
 		System:    "You are a contrarian who always insists the answer is green, no matter the question.",
 	})
@@ -170,11 +171,11 @@ func TestSeededSamplingDeterministic(t *testing.T) {
 		t.Skip("model has no chat template")
 	}
 	o := lm.GenOptions{MaxTokens: 16, Temp: 0.8, TopK: 40, Seed: 7}
-	a, err := eng.Generate("Write a short sentence about the sea.", true, o)
+	a, err := eng.Generate(context.Background(), "Write a short sentence about the sea.", true, o)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := eng.Generate("Write a short sentence about the sea.", true, o)
+	b, err := eng.Generate(context.Background(), "Write a short sentence about the sea.", true, o)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,12 +195,12 @@ func TestMultiTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conv.Close()
-	if r1, err := conv.Send("My name is Vlad. Remember it."); err != nil {
+	if r1, err := conv.Send(context.Background(), "My name is Vlad. Remember it."); err != nil {
 		t.Fatal(err)
 	} else if r1 == "" {
 		t.Fatal("empty turn 1")
 	}
-	r2, err := conv.Send("What is my name?")
+	r2, err := conv.Send(context.Background(), "What is my name?")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,5 +209,27 @@ func TestMultiTurn(t *testing.T) {
 	}
 	if !strings.Contains(r2, "Vlad") {
 		t.Logf("note: turn-2 reply did not echo the name (model-dependent): %q", r2)
+	}
+}
+
+// Cancelling the context mid-generation must stop the decode loop promptly
+// and surface context.Canceled.
+func TestGenerateCancellation(t *testing.T) {
+	eng := openEngine(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pieces := 0
+	_, err := eng.GenerateStream(ctx, "Write a long story about the sea.", false,
+		lm.GenOptions{MaxTokens: 512}, func(string) {
+			pieces++
+			if pieces == 2 {
+				cancel()
+			}
+		})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if pieces < 2 || pieces > 4 {
+		t.Fatalf("decode ran %d pieces past cancellation", pieces)
 	}
 }

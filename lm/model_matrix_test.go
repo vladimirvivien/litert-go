@@ -86,7 +86,7 @@ func matrixModel(t *testing.T, lib, modelPath string, accel litert.HwAccelerator
 
 	t.Run("generate", func(t *testing.T) {
 		t0 := time.Now()
-		out, err := eng.Generate(prompt, chat, o)
+		out, err := eng.Generate(context.Background(), prompt, chat, o)
 		if err != nil {
 			t.Fatalf("generate: %v", err)
 		}
@@ -96,7 +96,7 @@ func matrixModel(t *testing.T, lib, modelPath string, accel litert.HwAccelerator
 		t.Logf("greedy (%v, chat=%v): %q", time.Since(t0).Round(time.Millisecond), chat, out)
 
 		var sb strings.Builder
-		ret, err := eng.GenerateStream(prompt, chat, o, func(p string) { sb.WriteString(p) })
+		ret, err := eng.GenerateStream(context.Background(), prompt, chat, o, func(p string) { sb.WriteString(p) })
 		if err != nil {
 			t.Fatalf("stream: %v", err)
 		}
@@ -133,14 +133,14 @@ func matrixModel(t *testing.T, lib, modelPath string, accel litert.HwAccelerator
 			t.Fatalf("conversation: %v", err)
 		}
 		defer conv.Close()
-		r1, err := conv.Send("My name is Vlad. Remember it.")
+		r1, err := conv.Send(context.Background(), "My name is Vlad. Remember it.")
 		if err != nil {
 			t.Fatalf("turn 1: %v", err)
 		}
 		if r1 == "" {
 			t.Fatal("empty turn 1")
 		}
-		r2, err := conv.Send("What is my name?")
+		r2, err := conv.Send(context.Background(), "What is my name?")
 		if err != nil {
 			t.Fatalf("turn 2: %v", err)
 		}

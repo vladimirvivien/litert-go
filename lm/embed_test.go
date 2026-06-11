@@ -36,11 +36,11 @@ func openEmbedEngine(t *testing.T) *lm.Engine {
 func TestEmbedGenerateReentrant(t *testing.T) {
 	eng := openEmbedEngine(t)
 	o := lm.GenOptions{MaxTokens: 16}
-	a, err := eng.Generate("Name one primary color.", true, o)
+	a, err := eng.Generate(context.Background(), "Name one primary color.", true, o)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := eng.Generate("Name one primary color.", true, o)
+	b, err := eng.Generate(context.Background(), "Name one primary color.", true, o)
 	if err != nil {
 		t.Fatalf("second Generate failed (embedders must be reusable): %v", err)
 	}
@@ -58,12 +58,12 @@ func TestEmbedChatMultiTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer chat.Close()
-	if r1, err := chat.Send("My name is Vlad. Remember it."); err != nil {
+	if r1, err := chat.Send(context.Background(), "My name is Vlad. Remember it."); err != nil {
 		t.Fatalf("turn 1: %v", err)
 	} else if r1 == "" {
 		t.Fatal("empty turn 1")
 	}
-	r2, err := chat.Send("What is my name?")
+	r2, err := chat.Send(context.Background(), "What is my name?")
 	if err != nil {
 		t.Fatalf("turn 2: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestEmbedChatMultiTurn(t *testing.T) {
 func TestEmbedSessionMatchesGenerate(t *testing.T) {
 	eng := openEmbedEngine(t)
 	o := lm.GenOptions{MaxTokens: 16}
-	want, err := eng.Generate("Name one primary color.", true, o)
+	want, err := eng.Generate(context.Background(), "Name one primary color.", true, o)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestEmbedSessionMatchesGenerate(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conv.Close()
-	got, err := conv.Send("Name one primary color.")
+	got, err := conv.Send(context.Background(), "Name one primary color.")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,12 +106,12 @@ func TestEmbedSessionMultiTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conv.Close()
-	if r1, err := conv.Send("My name is Vlad. Remember it."); err != nil {
+	if r1, err := conv.Send(context.Background(), "My name is Vlad. Remember it."); err != nil {
 		t.Fatal(err)
 	} else if r1 == "" {
 		t.Fatal("empty turn 1")
 	}
-	r2, err := conv.Send("What is my name?")
+	r2, err := conv.Send(context.Background(), "What is my name?")
 	if err != nil {
 		t.Fatal(err)
 	}

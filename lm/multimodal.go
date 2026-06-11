@@ -1,6 +1,7 @@
 package lm
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -30,7 +31,7 @@ func (e *Engine) requireMultiModal(fn string) error {
 // generateModal splices precomputed modality embeddings (mm = tReal rows of h
 // floats) into the prompt at marker — wrapped beginTok…endTok, each modality
 // position a softToken sentinel — and decodes the reply.
-func (e *Engine) generateModal(prompt, marker, beginTok, endTok string, softToken int32, mm []float32, tReal int, o GenOptions) (string, error) {
+func (e *Engine) generateModal(ctx context.Context, prompt, marker, beginTok, endTok string, softToken int32, mm []float32, tReal int, o GenOptions) (string, error) {
 	emb, ple, err := e.ensureEmbedders()
 	if err != nil {
 		return "", err
@@ -47,7 +48,7 @@ func (e *Engine) generateModal(prompt, marker, beginTok, endTok string, softToke
 	if err != nil {
 		return "", err
 	}
-	gen, err := decodeMultiModal(e.env, e.cm, e.pre, e.decode, emb, ple, ids, text, perLayer,
+	gen, err := decodeMultiModal(ctx, e.env, e.cm, e.pre, e.decode, emb, ple, ids, text, perLayer,
 		o.MaxTokens, stopSet(e.tok, e.md), newSampler(o.Temp, o.TopK, o.TopP, o.Seed), e.singleKV())
 	if err != nil {
 		return "", err
@@ -113,7 +114,7 @@ func (e *Engine) embedModal(emb, ple *embedModel, ids []int32, mm []float32, h i
 // decodeMultiModal prefills a prompt whose text embeddings already have the
 // modality rows spliced in (text/perLayer cover all promptIDs), then decodes
 // from the held-back last token.
-func decodeMultiModal(env litert.Environment, cm litert.CompiledModel, pre prefiller, decode sig, emb, ple *embedModel, promptIDs []int32, text, perLayer []float32, ngen int, stop map[int32]bool, smp *sampler, singleKV bool) ([]int, error) {
+func decodeMultiModal(ctx context.Context, env litert.Environment, cm litert.CompiledModel, pre prefiller, decode sig, emb, ple *embedModel, promptIDs []int32, text, perLayer []float32, ngen int, stop map[int32]bool, smp *sampler, singleKV bool) ([]int, error) {
 	kv, err := allocKVBanks(env, cm, pre.max(), singleKV)
 	if err != nil {
 		return nil, err
@@ -127,7 +128,7 @@ func decodeMultiModal(env litert.Environment, cm litert.CompiledModel, pre prefi
 		l = len(perLayer) / n
 	}
 	p := n - 1
-	if err := prefillEmbedDataRun(env, cm, pre, kv, text[:p*h], perLayer[:p*l], p, 0); err != nil {
+	if err := prefillEmbedDataRun(ctx, env, cm, pre, kv, text[:p*h], perLayer[:p*l], p, 0); err != nil {
 		return nil, fmt.Errorf("prefill: %w", err)
 	}
 
@@ -141,6 +142,9 @@ func decodeMultiModal(env litert.Environment, cm litert.CompiledModel, pre prefi
 	pos := p
 	var gen []int
 	for g := 0; g < ngen; g++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		id, err := dec.step(next, pos)
 		if err != nil {
 			return nil, fmt.Errorf("decode step %d: %w", g, err)
