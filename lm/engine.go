@@ -388,6 +388,15 @@ func (e *Engine) Metadata() litertlm.Metadata { return e.md }
 // HasTokenizer reports whether the model shipped a SentencePiece tokenizer.
 func (e *Engine) HasTokenizer() bool { return e.tok != nil }
 
+// Tokenize converts text to model token IDs: the raw tokenizer
+// encoding, with no BOS token or chat-template affixes.
+func (e *Engine) Tokenize(text string) ([]int32, error) {
+	if e.tok == nil {
+		return nil, ErrNoTokenizer
+	}
+	return e.tok.Encode(text), nil
+}
+
 // HasChatTemplate reports whether the model has chat affixes (for Generate with
 // chat=true or NewChat).
 func (e *Engine) HasChatTemplate() bool {
