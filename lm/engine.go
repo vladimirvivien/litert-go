@@ -434,6 +434,7 @@ type GenOptions struct {
 	Seed      int64   // sampling RNG seed
 	Spec      bool    // use MTP speculative decoding when available (greedy only)
 	System    string  // optional system prompt, rendered at the conversation start (chat only)
+	ToolsJSON string  // OpenAI-style tool specs, rendered into the conversation start (tool-capable families only)
 }
 
 // Generate completes prompt and returns the generated text. When chat is true
@@ -606,6 +607,7 @@ type Session struct {
 	e       *Engine
 	o       GenOptions
 	tpl     litertlm.PromptTemplates
+	start   string // conversation-start render: system prompt + tool declarations
 	stop    map[int32]bool
 	kv      *kvBanks
 	dec     *decoder
@@ -628,11 +630,15 @@ func (e *Engine) NewSession(o GenOptions) (*Session, error) {
 	if !ok {
 		return nil, fmt.Errorf("%w (model type %q)", ErrNoChatTemplate, e.md.ModelType)
 	}
+	start, err := conversationStart(e, tpl, o)
+	if err != nil {
+		return nil, err
+	}
 	kv, err := allocKVBanks(e.env, e.cm, e.pre.max(), false)
 	if err != nil {
 		return nil, err
 	}
-	s := &Session{e: e, o: o, tpl: tpl, stop: stopSet(e.tok, e.md), kv: kv}
+	s := &Session{e: e, o: o, tpl: tpl, start: start, stop: stopSet(e.tok, e.md), kv: kv}
 	dec, err := newDecoder(e.env, e.cm, e.decode, s.kv, newSampler(o.Temp, o.TopK, o.TopP, o.Seed))
 	if err != nil {
 		s.Close()
@@ -663,13 +669,35 @@ func (s *Session) SendStream(ctx context.Context, userText string, onPiece func(
 }
 
 func (s *Session) send(ctx context.Context, userText string, onPiece func(string)) (string, error) {
-	// Render the new turn. The first turn carries the start token; later turns
-	// first close the previous model turn with its suffix.
-	render := s.tpl.User.Prefix + userText + s.tpl.User.Suffix + s.tpl.Model.Prefix
+	return s.sendTurn(ctx, s.tpl.User.Prefix+userText+s.tpl.User.Suffix, onPiece)
+}
+
+// SendToolResults delivers function results to the model and decodes
+// its follow-up turn. The conversation must target a tool-capable
+// family.
+func (s *Session) SendToolResults(ctx context.Context, results []ToolResult) (string, error) {
+	return s.SendToolResultsStream(ctx, results, nil)
+}
+
+// SendToolResultsStream is SendToolResults with incremental output.
+func (s *Session) SendToolResultsStream(ctx context.Context, results []ToolResult, onPiece func(string)) (string, error) {
+	turn, err := toolResultsTurn(s.e, results)
+	if err != nil {
+		return "", err
+	}
+	return s.sendTurn(ctx, turn, onPiece)
+}
+
+// sendTurn ingests one rendered turn and decodes the model's reply.
+// The first turn carries the start token and the conversation-start
+// render; later turns first close the previous model turn with its
+// suffix.
+func (s *Session) sendTurn(ctx context.Context, turn string, onPiece func(string)) (string, error) {
+	render := turn + s.tpl.Model.Prefix
 	var ids []int32
 	if !s.started {
 		ids = startIDs(s.e.tok, s.e.md)
-		render = renderSystem(s.tpl, s.o.System) + render
+		render = s.start + render
 		s.started = true
 	} else {
 		render = modelBoundary(s.e.md, s.tpl) + render

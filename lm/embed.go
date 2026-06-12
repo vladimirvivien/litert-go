@@ -491,6 +491,7 @@ type embedSession struct {
 	e       *Engine
 	o       GenOptions
 	tpl     litertlm.PromptTemplates
+	start   string // conversation-start render: system prompt + tool declarations
 	stop    map[int32]bool
 	kv      *kvBanks
 	dec     *embedDecoder
@@ -503,11 +504,15 @@ func (e *Engine) newEmbedSession(o GenOptions) (*embedSession, error) {
 	if !ok {
 		return nil, fmt.Errorf("%w (model type %q)", ErrNoChatTemplate, e.md.ModelType)
 	}
+	start, err := conversationStart(e, tpl, o)
+	if err != nil {
+		return nil, err
+	}
 	emb, ple, err := e.ensureEmbedders()
 	if err != nil {
 		return nil, err
 	}
-	s := &embedSession{e: e, o: o, tpl: tpl, stop: stopSet(e.tok, e.md)}
+	s := &embedSession{e: e, o: o, tpl: tpl, start: start, stop: stopSet(e.tok, e.md)}
 	done := false
 	defer func() {
 		if !done {
@@ -547,13 +552,35 @@ func (s *embedSession) SendStream(ctx context.Context, userText string, onPiece 
 }
 
 func (s *embedSession) send(ctx context.Context, userText string, onPiece func(string)) (string, error) {
-	// Render the new turn. The first turn carries the start token; later turns
-	// first close the previous model turn with its suffix.
-	render := s.tpl.User.Prefix + userText + s.tpl.User.Suffix + s.tpl.Model.Prefix
+	return s.sendTurn(ctx, s.tpl.User.Prefix+userText+s.tpl.User.Suffix, onPiece)
+}
+
+// SendToolResults delivers function results to the model and decodes
+// its follow-up turn. The conversation must target a tool-capable
+// family.
+func (s *embedSession) SendToolResults(ctx context.Context, results []ToolResult) (string, error) {
+	return s.SendToolResultsStream(ctx, results, nil)
+}
+
+// SendToolResultsStream is SendToolResults with incremental output.
+func (s *embedSession) SendToolResultsStream(ctx context.Context, results []ToolResult, onPiece func(string)) (string, error) {
+	turn, err := toolResultsTurn(s.e, results)
+	if err != nil {
+		return "", err
+	}
+	return s.sendTurn(ctx, turn, onPiece)
+}
+
+// sendTurn ingests one rendered turn and decodes the model's reply.
+// The first turn carries the start token and the conversation-start
+// render; later turns first close the previous model turn with its
+// suffix.
+func (s *embedSession) sendTurn(ctx context.Context, turn string, onPiece func(string)) (string, error) {
+	render := turn + s.tpl.Model.Prefix
 	var ids []int32
 	if !s.started {
 		ids = startIDs(s.e.tok, s.e.md)
-		render = renderSystem(s.tpl, s.o.System) + render
+		render = s.start + render
 		s.started = true
 	} else {
 		render = modelBoundary(s.e.md, s.tpl) + render

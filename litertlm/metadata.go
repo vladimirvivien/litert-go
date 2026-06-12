@@ -110,6 +110,34 @@ func FallbackTemplates(mt ModelType) (PromptTemplates, bool) {
 	return PromptTemplates{}, false
 }
 
+// ToolTemplates describes a family's function-calling syntax: the
+// markers that wrap tool declarations in the system turn, tool calls
+// in model output, and tool responses sent back, plus the token that
+// quotes string values in the FC expression syntax.
+type ToolTemplates struct {
+	DeclStart, DeclEnd string
+	CallStart, CallEnd string
+	RespStart, RespEnd string
+	Quote              string
+}
+
+// ToolTemplatesFor returns the family's tool syntax. ok is false for
+// families without validated tool support (as of LiteRT-LM v0.13.1
+// the C++ engine renders tools only for the Gemma 4 family; its qwen3
+// path drops tool specs and tool-result content).
+func ToolTemplatesFor(mt ModelType) (ToolTemplates, bool) {
+	switch mt {
+	case ModelGemma4:
+		return ToolTemplates{
+			DeclStart: "<|tool>", DeclEnd: "<tool|>",
+			CallStart: "<|tool_call>", CallEnd: "<tool_call|>",
+			RespStart: "<|tool_response>", RespEnd: "<tool_response|>",
+			Quote: `<|"|>`,
+		}, true
+	}
+	return ToolTemplates{}, false
+}
+
 // ReadMetadata parses the LlmMetadataProto section of a .litertlm container.
 // It returns an error if the container has no metadata section. ModelType is
 // Unknown and MaxNumTokens is 0 when the metadata omits those fields — common
