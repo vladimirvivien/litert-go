@@ -1,9 +1,13 @@
 # litert-go
 
-A pure-Go (no CGO) library for on-device LLM inference, built directly on the
-**LiteRT CompiledModel C API**: a `purego`-based binding plus a Go-authored
-LLM runtime (chat templating, bucketed prefill, KV-cache sessions, sampling,
-speculative decoding, vision/audio) on top. CPU and GPU (WebGPU) backends.
+Go bindings for **LiteRT**, Google's on-device AI runtime — pure Go, no
+CGO. The `litert` package runs LiteRT models through the **CompiledModel C
+API**; the `lm` package builds a complete LLM runtime on top (chat
+templating, bucketed prefill, KV-cache sessions, sampling, speculative
+decoding, vision/audio). CPU and GPU (WebGPU) backends.
+
+LLM inference is the initial focus; the direction is the full family of
+on-device AI/ML models in Go on the same binding.
 
 The kernels stay inside LiteRT's shared libraries; everything above them —
 the orchestration — is Go source that can be read, debugged, and extended

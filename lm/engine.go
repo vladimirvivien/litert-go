@@ -391,8 +391,23 @@ func (e *Engine) HasTokenizer() bool { return e.tok != nil }
 // HasChatTemplate reports whether the model has chat affixes (for Generate with
 // chat=true or NewChat).
 func (e *Engine) HasChatTemplate() bool {
-	_, ok := e.md.Templates()
+	_, ok := e.templates()
 	return ok
+}
+
+// templates resolves the chat affixes. Containers without llm_model_type are
+// family-inferred the way the C++ engine infers them — token id 105 decoding
+// to <start_of_turn> identifies the gemma family — and inferred-gemma3 models
+// take the canonical gemma3 affixes instead of the container's: published
+// gemma3 containers carry malformed prompt_templates (gemma3-270m embeds
+// literal backslash-n character pairs), and the canonical form is what the
+// C++ engine renders for the family.
+func (e *Engine) templates() (litertlm.PromptTemplates, bool) {
+	if e.md.ModelType == litertlm.ModelUnknown && e.tok != nil &&
+		e.tok.Decode([]int{105}) == "<start_of_turn>" {
+		return litertlm.FallbackTemplates(litertlm.ModelGemma3)
+	}
+	return e.md.Templates()
 }
 
 // SupportsSpec reports whether MTP speculative decoding is available (a verify
@@ -418,7 +433,7 @@ func (e *Engine) Generate(ctx context.Context, prompt string, chat bool, o GenOp
 	if e.tok == nil {
 		return "", fmt.Errorf("%w; use GenerateIDs", ErrNoTokenizer)
 	}
-	ids, err := buildPrompt(e.tok, e.md, o.System, prompt, chat)
+	ids, err := e.buildPrompt(o.System, prompt, chat)
 	if err != nil {
 		return "", err
 	}
@@ -441,7 +456,7 @@ func (e *Engine) GenerateStream(ctx context.Context, prompt string, chat bool, o
 	if e.tok == nil {
 		return "", fmt.Errorf("%w; use GenerateIDs", ErrNoTokenizer)
 	}
-	ids, err := buildPrompt(e.tok, e.md, o.System, prompt, chat)
+	ids, err := e.buildPrompt(o.System, prompt, chat)
 	if err != nil {
 		return "", err
 	}
@@ -503,7 +518,7 @@ func (e *Engine) NewChat(o GenOptions) (*Chat, error) {
 	if e.tok == nil {
 		return nil, ErrNoTokenizer
 	}
-	tpl, ok := e.md.Templates()
+	tpl, ok := e.templates()
 	if !ok {
 		return nil, fmt.Errorf("%w (model type %q)", ErrNoChatTemplate, e.md.ModelType)
 	}
@@ -600,7 +615,7 @@ func (e *Engine) NewSession(o GenOptions) (*Session, error) {
 	if sigHasInput(e.decode, "embeddings") {
 		return nil, fmt.Errorf("lm: NewSession supports token-input models only")
 	}
-	tpl, ok := e.md.Templates()
+	tpl, ok := e.templates()
 	if !ok {
 		return nil, fmt.Errorf("%w (model type %q)", ErrNoChatTemplate, e.md.ModelType)
 	}
@@ -977,11 +992,11 @@ type turn struct {
 
 // buildPrompt tokenizes text: as a raw completion (start token + text) or, with
 // chat set, wrapped in the model's chat template.
-func buildPrompt(tok tokenizer, md litertlm.Metadata, system, text string, chat bool) ([]int32, error) {
+func (e *Engine) buildPrompt(system, text string, chat bool) ([]int32, error) {
 	if chat {
-		return buildChatPrompt(tok, md, system, text)
+		return e.buildChatPrompt(system, text)
 	}
-	ids := append(startIDs(tok, md), tok.Encode(text)...)
+	ids := append(startIDs(e.tok, e.md), e.tok.Encode(text)...)
 	if len(ids) == 0 {
 		return nil, fmt.Errorf("empty tokenization of %q", text)
 	}
@@ -1001,8 +1016,9 @@ func renderSystem(tpl litertlm.PromptTemplates, system string) string {
 // user.prefix ++ userText ++ user.suffix ++ model.prefix. The turn markers in
 // the affixes (e.g. <start_of_turn>) are user-defined tokenizer pieces, so
 // encoding the rendered string yields their single vocab IDs.
-func buildChatPrompt(tok tokenizer, md litertlm.Metadata, system, userText string) ([]int32, error) {
-	tpl, ok := md.Templates()
+func (e *Engine) buildChatPrompt(system, userText string) ([]int32, error) {
+	tok, md := e.tok, e.md
+	tpl, ok := e.templates()
 	if !ok {
 		return nil, fmt.Errorf("no chat template for model type %q", md.ModelType)
 	}

@@ -499,7 +499,7 @@ type embedSession struct {
 }
 
 func (e *Engine) newEmbedSession(o GenOptions) (*embedSession, error) {
-	tpl, ok := e.md.Templates()
+	tpl, ok := e.templates()
 	if !ok {
 		return nil, fmt.Errorf("%w (model type %q)", ErrNoChatTemplate, e.md.ModelType)
 	}

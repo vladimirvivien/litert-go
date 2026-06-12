@@ -60,7 +60,7 @@ func (e *Engine) generateModal(ctx context.Context, prompt, marker, beginTok, en
 // marker position: beginTok, tReal softToken sentinels, endTok, at the token
 // level.
 func (e *Engine) buildModalPrompt(prompt, system, marker, beginTok, endTok string, softToken int32, tReal int) ([]int32, error) {
-	tpl, ok := e.md.Templates()
+	tpl, ok := e.templates()
 	if !ok {
 		return nil, fmt.Errorf("%w (model type %q)", ErrNoChatTemplate, e.md.ModelType)
 	}
