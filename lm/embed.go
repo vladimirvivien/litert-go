@@ -526,6 +526,12 @@ func (e *Engine) newEmbedSession(o GenOptions) (*embedSession, error) {
 	if s.dec, err = newEmbedDecoder(e.env, e.cm, e.decode, s.kv, emb, ple, newSampler(o.Temp, o.TopK, o.TopP, o.Seed)); err != nil {
 		return nil, err
 	}
+	if len(o.History) > 0 {
+		if err := s.ingestHistory(context.Background(), o.History); err != nil {
+			s.Close()
+			return nil, err
+		}
+	}
 	done = true
 	return s, nil
 }
@@ -539,6 +545,24 @@ func (s *embedSession) Close() {
 	if s.kv != nil {
 		s.kv.close()
 	}
+}
+
+func (s *embedSession) ingestHistory(ctx context.Context, history []Message) error {
+	ids := buildHistory(s.e.tok, s.e.md, s.tpl, s.start, history)
+	if len(ids) == 0 {
+		return nil
+	}
+	if err := prefillEmbedRun(ctx, s.e.env, s.e.cm, s.e.pre, s.kv, s.e.emb, s.e.ple, ids, 0); err != nil {
+		return fmt.Errorf("prefill: %w", err)
+	}
+	s.pos = len(ids)
+	s.started = true
+	return nil
+}
+
+// TokenCount returns the number of tokens currently stored in the session's KV cache.
+func (s *embedSession) TokenCount() int {
+	return s.pos
 }
 
 // Send adds a user message and returns the reply.

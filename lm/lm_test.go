@@ -233,3 +233,41 @@ func TestGenerateCancellation(t *testing.T) {
 		t.Fatalf("decode ran %d pieces past cancellation", pieces)
 	}
 }
+
+// Pre-seeding a conversation with history must correctly populate the context.
+func TestNewConversationWithHistory(t *testing.T) {
+	eng := openEngine(t)
+	if !eng.HasChatTemplate() {
+		t.Skip("model has no chat template")
+	}
+	history := []lm.Message{
+		{Role: "user", Text: "My name is Alice. Remember it."},
+		{Role: "model", Text: "Hello Alice! I will remember your name."},
+	}
+	conv, err := eng.NewConversation(lm.GenOptions{
+		MaxTokens: 32,
+		History:   history,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conv.Close()
+
+	// Exposing position / tokens check
+	tc := conv.TokenCount()
+	if tc <= 0 {
+		t.Errorf("TokenCount = %d, want > 0 after history prefill", tc)
+	}
+
+	r2, err := conv.Send(context.Background(), "What is my name?")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r2 == "" {
+		t.Fatal("empty reply after history")
+	}
+	if !strings.Contains(r2, "Alice") {
+		t.Logf("note: turn-2 reply after history did not echo the name (model-dependent): %q", r2)
+	}
+}
+

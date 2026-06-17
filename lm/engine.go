@@ -425,16 +425,23 @@ func (e *Engine) SupportsSpec() bool {
 	return e.haveVerify && sigHasInput(e.decode, "embeddings")
 }
 
+// Message is one message in a conversation history.
+type Message struct {
+	Role string // "user", "model", "system"
+	Text string
+}
+
 // GenOptions configures one generation.
 type GenOptions struct {
-	MaxTokens int     // cap on generated tokens
-	Temp      float32 // sampling temperature; 0 = greedy
-	TopK      int     // top-k filter; 0 = off
-	TopP      float32 // top-p / nucleus filter; 0 = off
-	Seed      int64   // sampling RNG seed
-	Spec      bool    // use MTP speculative decoding when available (greedy only)
-	System    string  // optional system prompt, rendered at the conversation start (chat only)
-	ToolsJSON string  // OpenAI-style tool specs, rendered into the conversation start (tool-capable families only)
+	MaxTokens int       // cap on generated tokens
+	Temp      float32   // sampling temperature; 0 = greedy
+	TopK      int       // top-k filter; 0 = off
+	TopP      float32   // top-p / nucleus filter; 0 = off
+	Seed      int64     // sampling RNG seed
+	Spec      bool      // use MTP speculative decoding when available (greedy only)
+	System    string    // optional system prompt, rendered at the conversation start (chat only)
+	ToolsJSON string    // OpenAI-style tool specs, rendered into the conversation start (tool-capable families only)
+	History   []Message // optional pre-populated conversation history
 }
 
 // Generate completes prompt and returns the generated text. When chat is true
@@ -536,12 +543,21 @@ func (e *Engine) NewChat(o GenOptions) (*Chat, error) {
 	if o.System != "" {
 		c.hist = append(c.hist, turn{role: "system", text: o.System})
 	}
+	for _, msg := range o.History {
+		c.hist = append(c.hist, turn{role: msg.Role, text: msg.Text})
+	}
 	return c, nil
 }
 
 // Close releases the Chat. Chat holds no resources of its own (the Engine owns
 // the model); it exists to satisfy Conversation.
 func (c *Chat) Close() {}
+
+// TokenCount returns the number of tokens in the conversation history.
+func (c *Chat) TokenCount() int {
+	prompt := buildConversation(c.e.tok, c.e.md, c.tpl, c.hist)
+	return len(prompt)
+}
 
 // Send adds a user message and returns the model's reply, retaining both for
 // context on subsequent calls.
@@ -582,6 +598,7 @@ func (c *Chat) send(ctx context.Context, userText string, onPiece func(string)) 
 type Conversation interface {
 	Send(ctx context.Context, userText string) (string, error)
 	SendStream(ctx context.Context, userText string, onPiece func(string)) (string, error)
+	TokenCount() int
 	Close()
 }
 
@@ -645,6 +662,12 @@ func (e *Engine) NewSession(o GenOptions) (*Session, error) {
 		return nil, err
 	}
 	s.dec = dec
+	if len(o.History) > 0 {
+		if err := s.ingestHistory(context.Background(), o.History); err != nil {
+			s.Close()
+			return nil, err
+		}
+	}
 	return s, nil
 }
 
@@ -656,6 +679,11 @@ func (s *Session) Close() {
 	if s.kv != nil {
 		s.kv.close()
 	}
+}
+
+// TokenCount returns the number of tokens currently stored in the session's KV cache.
+func (s *Session) TokenCount() int {
+	return s.pos
 }
 
 // Send adds a user message and returns the reply.
@@ -1514,4 +1542,50 @@ func argmaxF32(b litert.TensorBuffer, n int) (int32, error) {
 		}
 	}
 	return int32(idx), nil
+}
+
+// buildHistory renders the conversation history into a single segment of token
+// IDs, prepending the start token and system prompt if set, and preserving turn boundaries.
+func buildHistory(tok tokenizer, md litertlm.Metadata, tpl litertlm.PromptTemplates, start string, history []Message) []int32 {
+	if len(history) == 0 {
+		return nil
+	}
+	affix := func(role string) litertlm.Affixes {
+		switch role {
+		case "model":
+			return tpl.Model
+		case "system":
+			return tpl.System
+		default:
+			return tpl.User
+		}
+	}
+	var sb strings.Builder
+	sb.WriteString(start)
+	for i, h := range history {
+		a := affix(h.Role)
+		sb.WriteString(a.Prefix)
+		sb.WriteString(h.Text)
+		if h.Role == "model" {
+			if i < len(history)-1 {
+				sb.WriteString(modelBoundary(md, tpl))
+			}
+		} else {
+			sb.WriteString(a.Suffix)
+		}
+	}
+	return append(startIDs(tok, md), tok.Encode(sb.String())...)
+}
+
+func (s *Session) ingestHistory(ctx context.Context, history []Message) error {
+	ids := buildHistory(s.e.tok, s.e.md, s.tpl, s.start, history)
+	if len(ids) == 0 {
+		return nil
+	}
+	if err := prefillTokenRun(ctx, s.e.env, s.e.cm, s.e.pre, s.kv, ids, 0); err != nil {
+		return err
+	}
+	s.pos = len(ids)
+	s.started = true
+	return nil
 }

@@ -119,11 +119,15 @@ func (l *lazyFun) Call(ret any, args ...any) {
 // or writes through). The caller must already have pinned every such slot in
 // pin; invoke pins only the status return slot. The caller's deferred
 // pin.Unpin releases them all once the call has returned.
+//
+// The return slot must be ffi.Arg-sized: libffi widens integral returns to a
+// full ffi_arg, writing 8 bytes through the ret pointer. A narrower slot is a
+// 4-byte heap overrun into the adjacent allocation on every call.
 func invoke(pin *runtime.Pinner, fn *lazyFun, args ...any) Status {
-	var st int32
+	var st ffi.Arg
 	pin.Pin(&st)
 	fn.Call(&st, args...)
-	return Status(st)
+	return Status(int32(st))
 }
 
 // cbytes returns a NUL-terminated copy of s. The caller must pin the result

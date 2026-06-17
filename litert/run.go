@@ -3,6 +3,8 @@ package litert
 import (
 	"runtime"
 	"unsafe"
+
+	"github.com/jupiterrider/ffi"
 )
 
 // Runner repeatedly invokes one signature of a compiled model with a fixed set
@@ -16,7 +18,9 @@ import (
 // closed. A Runner must be used through the pointer returned by NewRunner and is
 // not safe for concurrent use.
 type Runner struct {
-	st     int32
+	// st must be ffi.Arg-sized: libffi widens the LiteRtStatus return to a
+	// full ffi_arg and writes 8 bytes through the ret pointer.
+	st     ffi.Arg
 	cm     uintptr
 	sig    uint64
 	nin    uint64
@@ -75,7 +79,7 @@ func (r *Runner) Run() error {
 		unsafe.Pointer(&r.cm), unsafe.Pointer(&r.sig),
 		unsafe.Pointer(&r.nin), unsafe.Pointer(&r.inp),
 		unsafe.Pointer(&r.nout), unsafe.Pointer(&r.outp))
-	return Status(r.st).err("LiteRtRunCompiledModel")
+	return Status(int32(r.st)).err("LiteRtRunCompiledModel")
 }
 
 // RunAsync invokes the bound signature asynchronously when the backend
@@ -101,7 +105,7 @@ func (r *Runner) RunAsync() (bool, error) {
 		unsafe.Pointer(&r.nin), unsafe.Pointer(&r.inp),
 		unsafe.Pointer(&r.nout), unsafe.Pointer(&r.outp),
 		unsafe.Pointer(&r.asyncP))
-	return r.async != 0, Status(r.st).err("LiteRtRunCompiledModelAsync")
+	return r.async != 0, Status(int32(r.st)).err("LiteRtRunCompiledModelAsync")
 }
 
 // Close releases the pinned call arguments. It does not close the bound
