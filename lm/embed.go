@@ -99,19 +99,19 @@ func (e *embedModel) close() {
 // decodeEmbeddingInput runs the gemma 3n/4 pipeline: allocate the double-banked
 // i8 KV cache, prefill all but the last prompt token through the shared embedder
 // stages, then greedily decode from the held-back token.
-func decodeEmbeddingInput(ctx context.Context, env litert.Environment, cm litert.CompiledModel, pre prefiller, decode sig, emb, ple *embedModel, prompt []int32, ngen int, stop map[int32]bool, smp *sampler, singleKV bool, metrics func(DecodeStats), onToken func(int32)) ([]int, error) {
-	kv, err := allocKVBanks(env, cm, pre.max(), singleKV)
+func (e *Engine) decodeEmbeddingInput(ctx context.Context, prompt []int32, ngen int, stop map[int32]bool, smp *sampler, onToken func(int32)) ([]int, error) {
+	kv, err := e.getKVBanks(e.singleKV())
 	if err != nil {
 		return nil, err
 	}
-	defer kv.close()
+	defer e.putKVBanks(kv)
 
 	p := len(prompt) - 1
-	if err := prefillEmbedRun(ctx, env, cm, pre, kv, emb, ple, prompt[:p], 0); err != nil {
+	if err := prefillEmbedRun(ctx, e.env, e.cm, e.pre, kv, e.emb, e.ple, prompt[:p], 0); err != nil {
 		return nil, fmt.Errorf("prefill: %w", err)
 	}
 
-	dec, err := newEmbedDecoder(env, cm, decode, kv, emb, ple, smp)
+	dec, err := newEmbedDecoder(e.env, e.cm, e.decode, kv, e.emb, e.ple, smp)
 	if err != nil {
 		return nil, fmt.Errorf("decode setup: %w", err)
 	}
@@ -139,8 +139,8 @@ func decodeEmbeddingInput(ctx context.Context, env litert.Environment, cm litert
 		next = id
 		pos++
 	}
-	if metrics != nil {
-		metrics(DecodeStats{Tokens: len(gen), Decode: time.Since(t0)})
+	if e.metrics != nil {
+		e.metrics(DecodeStats{Tokens: len(gen), Decode: time.Since(t0)})
 	}
 	return gen, nil
 }
@@ -520,7 +520,7 @@ func (e *Engine) newEmbedSession(o GenOptions) (*embedSession, error) {
 		}
 	}()
 
-	if s.kv, err = allocKVBanks(e.env, e.cm, e.pre.max(), e.singleKV()); err != nil {
+	if s.kv, err = e.getKVBanks(e.singleKV()); err != nil {
 		return nil, err
 	}
 	if s.dec, err = newEmbedDecoder(e.env, e.cm, e.decode, s.kv, emb, ple, newSampler(o.Temp, o.TopK, o.TopP, o.Seed)); err != nil {
@@ -543,7 +543,7 @@ func (s *embedSession) Close() {
 		s.dec.close()
 	}
 	if s.kv != nil {
-		s.kv.close()
+		s.e.putKVBanks(s.kv)
 	}
 }
 

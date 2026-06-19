@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -72,6 +73,8 @@ type Engine struct {
 	vision      *visionPipeline // vision encoder + adapter, compiled once on first use
 	audio       *audioPipeline  // audio encoder + adapter, compiled once on first use
 	lastText    string          // most recent streamed output (GenerateStream/SendStream)
+	kvPool      []*kvBanks
+	kvMu        sync.Mutex
 }
 
 // envOptions builds the LiteRt environment options: the runtime-library
@@ -291,6 +294,13 @@ func Open(ctx context.Context, modelPath string, options ...Option) (*Engine, er
 
 // Close releases the model, compiled model, and environment.
 func (e *Engine) Close() {
+	e.kvMu.Lock()
+	for _, kv := range e.kvPool {
+		kv.close()
+	}
+	e.kvPool = nil
+	e.kvMu.Unlock()
+
 	if e.emb != nil {
 		e.emb.close()
 	}
@@ -379,6 +389,19 @@ func (e *Engine) Tokenize(text string) ([]int32, error) {
 		return nil, ErrNoTokenizer
 	}
 	return e.tok.Encode(text), nil
+}
+
+// Detokenize converts model token IDs back to text: the raw tokenizer
+// decoding.
+func (e *Engine) Detokenize(ids []int32) (string, error) {
+	if e.tok == nil {
+		return "", ErrNoTokenizer
+	}
+	intIDs := make([]int, len(ids))
+	for i, id := range ids {
+		intIDs[i] = int(id)
+	}
+	return e.tok.Decode(intIDs), nil
 }
 
 // HasChatTemplate reports whether the model has chat affixes (for Generate with
@@ -494,13 +517,13 @@ func (e *Engine) generate(ctx context.Context, prompt []int32, o GenOptions, onT
 		}
 		return decodeSpeculative(ctx, e.env, e.cm, e.fileBytes, e.pre, e.decode, e.verify, emb, ple, prompt, o.MaxTokens, stop, e.accel, e.modelKey, e.gpuCacheDir, onToken)
 	case sigHasInput(e.decode, "embeddings"):
-		emb, ple, err := e.ensureEmbedders()
+		_, _, err := e.ensureEmbedders()
 		if err != nil {
 			return nil, err
 		}
-		return decodeEmbeddingInput(ctx, e.env, e.cm, e.pre, e.decode, emb, ple, prompt, o.MaxTokens, stop, smp, e.singleKV(), e.metrics, onToken)
+		return e.decodeEmbeddingInput(ctx, prompt, o.MaxTokens, stop, smp, onToken)
 	default:
-		return decodeTokenInput(ctx, e.env, e.cm, e.pre, e.decode, prompt, o.MaxTokens, stop, smp, e.metrics, onToken)
+		return e.decodeTokenInput(ctx, prompt, o.MaxTokens, stop, smp, onToken)
 	}
 }
 
@@ -635,7 +658,7 @@ func (e *Engine) NewSession(o GenOptions) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	kv, err := allocKVBanks(e.env, e.cm, e.pre.max(), false)
+	kv, err := e.getKVBanks(false)
 	if err != nil {
 		return nil, err
 	}
@@ -661,7 +684,7 @@ func (s *Session) Close() {
 		s.dec.close()
 	}
 	if s.kv != nil {
-		s.kv.close()
+		s.e.putKVBanks(s.kv)
 	}
 }
 
@@ -978,6 +1001,52 @@ func allocKVBanks(env litert.Environment, cm litert.CompiledModel, g sig, single
 	return &kvBanks{a: a, b: b}, nil
 }
 
+func (e *Engine) getKVBanks(single bool) (*kvBanks, error) {
+	e.kvMu.Lock()
+	n := len(e.kvPool)
+	for i := 0; i < n; i++ {
+		kv := e.kvPool[i]
+		if kv.single == single {
+			// Remove from pool
+			e.kvPool[i] = e.kvPool[n-1]
+			e.kvPool = e.kvPool[:n-1]
+			e.kvMu.Unlock()
+			if err := kv.clear(); err != nil {
+				kv.close()
+				return allocKVBanks(e.env, e.cm, e.pre.max(), single)
+			}
+			return kv, nil
+		}
+	}
+	e.kvMu.Unlock()
+	return allocKVBanks(e.env, e.cm, e.pre.max(), single)
+}
+
+func (e *Engine) putKVBanks(kv *kvBanks) {
+	if kv == nil {
+		return
+	}
+	e.kvMu.Lock()
+	e.kvPool = append(e.kvPool, kv)
+	e.kvMu.Unlock()
+}
+
+func (k *kvBanks) clear() error {
+	for _, buf := range k.a {
+		if err := buf.Clear(); err != nil {
+			return err
+		}
+	}
+	if !k.single {
+		for _, buf := range k.b {
+			if err := buf.Clear(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (k *kvBanks) in() map[string]litert.TensorBuffer {
 	if k.bIn {
 		return k.b
@@ -1171,19 +1240,19 @@ func stopSet(tok tokenizer, md litertlm.Metadata) map[int32]bool {
 // decodeTokenInput runs the static token-input pipeline (gemma3, qwen3, …):
 // allocate the KV cache once, prefill all but the last prompt token, then
 // decode from the held-back token.
-func decodeTokenInput(ctx context.Context, env litert.Environment, cm litert.CompiledModel, pre prefiller, decode sig, prompt []int32, ngen int, stop map[int32]bool, smp *sampler, metrics func(DecodeStats), onToken func(int32)) ([]int, error) {
-	kv, err := allocKVBanks(env, cm, pre.max(), false)
+func (e *Engine) decodeTokenInput(ctx context.Context, prompt []int32, ngen int, stop map[int32]bool, smp *sampler, onToken func(int32)) ([]int, error) {
+	kv, err := e.getKVBanks(false)
 	if err != nil {
 		return nil, err
 	}
-	defer kv.close()
+	defer e.putKVBanks(kv)
 
 	p := len(prompt) - 1
-	if err := prefillTokenRun(ctx, env, cm, pre, kv, prompt[:p], 0); err != nil {
+	if err := prefillTokenRun(ctx, e.env, e.cm, e.pre, kv, prompt[:p], 0); err != nil {
 		return nil, fmt.Errorf("prefill: %w", err)
 	}
 
-	dec, err := newDecoder(env, cm, decode, kv, smp)
+	dec, err := newDecoder(e.env, e.cm, e.decode, kv, smp)
 	if err != nil {
 		return nil, fmt.Errorf("decode setup: %w", err)
 	}
@@ -1211,8 +1280,8 @@ func decodeTokenInput(ctx context.Context, env litert.Environment, cm litert.Com
 		next = id
 		pos++
 	}
-	if metrics != nil {
-		metrics(DecodeStats{Tokens: len(gen), Decode: time.Since(t0)})
+	if e.metrics != nil {
+		e.metrics(DecodeStats{Tokens: len(gen), Decode: time.Since(t0)})
 	}
 	return gen, nil
 }

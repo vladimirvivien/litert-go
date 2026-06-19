@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-
-	"github.com/vladimirvivien/litert-go/litert"
 )
 
 // Multimodal sentinel token ids marking modality-embedding positions in the
@@ -48,8 +46,8 @@ func (e *Engine) generateModal(ctx context.Context, prompt, marker, beginTok, en
 	if err != nil {
 		return "", err
 	}
-	gen, err := decodeMultiModal(ctx, e.env, e.cm, e.pre, e.decode, emb, ple, ids, text, perLayer,
-		o.MaxTokens, stopSet(e.tok, e.md), newSampler(o.Temp, o.TopK, o.TopP, o.Seed), e.singleKV())
+	gen, err := e.decodeMultiModal(ctx, ids, text, perLayer,
+		o.MaxTokens, stopSet(e.tok, e.md), newSampler(o.Temp, o.TopK, o.TopP, o.Seed))
 	if err != nil {
 		return "", err
 	}
@@ -114,12 +112,12 @@ func (e *Engine) embedModal(emb, ple *embedModel, ids []int32, mm []float32, h i
 // decodeMultiModal prefills a prompt whose text embeddings already have the
 // modality rows spliced in (text/perLayer cover all promptIDs), then decodes
 // from the held-back last token.
-func decodeMultiModal(ctx context.Context, env litert.Environment, cm litert.CompiledModel, pre prefiller, decode sig, emb, ple *embedModel, promptIDs []int32, text, perLayer []float32, ngen int, stop map[int32]bool, smp *sampler, singleKV bool) ([]int, error) {
-	kv, err := allocKVBanks(env, cm, pre.max(), singleKV)
+func (e *Engine) decodeMultiModal(ctx context.Context, promptIDs []int32, text, perLayer []float32, ngen int, stop map[int32]bool, smp *sampler) ([]int, error) {
+	kv, err := e.getKVBanks(e.singleKV())
 	if err != nil {
 		return nil, err
 	}
-	defer kv.close()
+	defer e.putKVBanks(kv)
 
 	n := len(promptIDs)
 	h := len(text) / n
@@ -128,11 +126,11 @@ func decodeMultiModal(ctx context.Context, env litert.Environment, cm litert.Com
 		l = len(perLayer) / n
 	}
 	p := n - 1
-	if err := prefillEmbedDataRun(ctx, env, cm, pre, kv, text[:p*h], perLayer[:p*l], p, 0); err != nil {
+	if err := prefillEmbedDataRun(ctx, e.env, e.cm, e.pre, kv, text[:p*h], perLayer[:p*l], p, 0); err != nil {
 		return nil, fmt.Errorf("prefill: %w", err)
 	}
 
-	dec, err := newEmbedDecoder(env, cm, decode, kv, emb, ple, smp)
+	dec, err := newEmbedDecoder(e.env, e.cm, e.decode, kv, e.emb, e.ple, smp)
 	if err != nil {
 		return nil, fmt.Errorf("decode setup: %w", err)
 	}

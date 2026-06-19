@@ -95,7 +95,7 @@ func (m Metadata) Templates() (PromptTemplates, bool) {
 // docs, not Jinja).
 func FallbackTemplates(mt ModelType) (PromptTemplates, bool) {
 	switch mt {
-	case ModelGemma3:
+	case ModelGemma3, ModelFunctionGemma:
 		return PromptTemplates{
 			User:  Affixes{Prefix: "<start_of_turn>user\n", Suffix: "<end_of_turn>\n"},
 			Model: Affixes{Prefix: "<start_of_turn>model\n", Suffix: "<end_of_turn>\n"},
