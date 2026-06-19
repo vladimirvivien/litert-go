@@ -7,9 +7,7 @@
 // embedder stages), with chat templating, temperature/top-k/top-p sampling, and
 // MTP speculative decoding.
 package lm
-
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"math"
@@ -21,10 +19,10 @@ import (
 	"time"
 	"unsafe"
 
-	sentencepiece "github.com/eliben/go-sentencepiece"
 	"github.com/vladimirvivien/litert-go/hftok"
 	"github.com/vladimirvivien/litert-go/litert"
 	"github.com/vladimirvivien/litert-go/litertlm"
+	"github.com/vladimirvivien/litert-go/sptok"
 )
 
 // maskNeg is the "masked" attention value LiteRT-LM uses for f32 (-0.7 * FLT_MAX).
@@ -40,20 +38,7 @@ type tokenizer interface {
 	EOS() int32
 }
 
-// spTokenizer adapts a SentencePiece processor to the tokenizer interface.
-type spTokenizer struct{ p *sentencepiece.Processor }
 
-func (s spTokenizer) Encode(text string) []int32 {
-	toks := s.p.Encode(text)
-	ids := make([]int32, len(toks))
-	for i, t := range toks {
-		ids[i] = int32(t.ID)
-	}
-	return ids
-}
-func (s spTokenizer) Decode(ids []int) string { return s.p.Decode(ids) }
-func (s spTokenizer) BOS() int32              { return int32(s.p.ModelInfo().BeginningOfSentenceID) }
-func (s spTokenizer) EOS() int32              { return int32(s.p.ModelInfo().EndOfSentenceID) }
 
 // hfTokenizer adapts an HF byte-level BPE tokenizer. It defines no BOS/EOS; the
 // metadata start_token / stop_tokens drive those.
@@ -246,12 +231,11 @@ func Open(ctx context.Context, modelPath string, options ...Option) (*Engine, er
 		}
 		e.md, _ = litertlm.ReadMetadata(e.fileBytes)
 		if sp, serr := litertlm.SectionBytes(e.fileBytes, litertlm.SectionSPTokenizer); serr == nil {
-			sp = rewriteRawSpacePieces(sp)
-			p, perr := sentencepiece.NewProcessor(bytes.NewReader(sp))
-			if perr != nil {
-				return nil, fmt.Errorf("load tokenizer: %w", perr)
+			tok, err := sptok.New(sp)
+			if err != nil {
+				return nil, fmt.Errorf("load tokenizer: %w", err)
 			}
-			e.tok = spTokenizer{p}
+			e.tok = tok
 		} else if hf, herr := litertlm.SectionBytes(e.fileBytes, litertlm.SectionHFTokenizerZlib); herr == nil {
 			h, herr := hftok.LoadSection(hf)
 			if herr != nil {
