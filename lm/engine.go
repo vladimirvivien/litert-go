@@ -440,17 +440,21 @@ type Message struct {
 
 // GenOptions configures one generation.
 type GenOptions struct {
-	MaxTokens   int              // cap on generated tokens
-	Temp        float32          // sampling temperature; 0 = greedy
-	TopK        int              // top-k filter; 0 = off
-	TopP        float32          // top-p / nucleus filter; 0 = off
-	Seed        int64            // sampling RNG seed
-	Spec        bool             // use MTP speculative decoding when available (greedy only)
-	System      string           // optional system prompt, rendered at the conversation start (chat only)
-	ToolsJSON   string           // OpenAI-style tool specs, rendered into the conversation start (tool-capable families only)
-	Tools       []ToolDefinition // high-level tool definitions for auto-dispatching
-	MaxToolHops int              // max hops in tool execution loop
-	History     []Message        // optional pre-populated conversation history
+	MaxTokens         int              // cap on generated tokens
+	Temp              float32          // sampling temperature; 0 = greedy
+	TopK              int              // top-k filter; 0 = off
+	TopP              float32          // top-p / nucleus filter; 0 = off
+	Seed              int64            // sampling RNG seed
+	Spec              bool             // use MTP speculative decoding when available (greedy only)
+	System            string           // optional system prompt, rendered at the conversation start (chat only)
+	ToolsJSON         string           // OpenAI-style tool specs, rendered into the conversation start (tool-capable families only)
+	Tools             []ToolDefinition // high-level tool definitions for auto-dispatching
+	MaxToolHops       int              // max hops in tool execution loop
+	History           []Message        // optional pre-populated conversation history
+	JSONSchema          string           // optional schema constraint
+	SchemaInstruction   string           // optional custom instruction for structured fallback path
+	Retries             int              // number of retries for parsing structured data
+	ConstrainedDecoding bool             // toggle engine's constrained decoding mode
 }
 
 // Generate completes prompt and returns the generated text. When chat is true
