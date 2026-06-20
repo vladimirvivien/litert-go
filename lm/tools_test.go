@@ -1,6 +1,7 @@
 package lm
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
@@ -130,5 +131,50 @@ func TestExtractToolCalls_RoundTripsResponseQuote(t *testing.T) {
 	}
 	if calls[0].Args["text"] != "hello, world: {ok}" {
 		t.Errorf("text arg = %q", calls[0].Args["text"])
+	}
+}
+
+type testArgs struct {
+	City string `json:"city" description:"City name."`
+	Days *int   `json:"days_count,omitempty" description:"Number of days."`
+}
+
+func TestRegisterTool_ReflectionSchema(t *testing.T) {
+	handler := func(ctx context.Context, in testArgs) (string, error) {
+		return "ok", nil
+	}
+	
+	tool, err := RegisterTool("get_weather", "Get weather information", handler)
+	if err != nil {
+		t.Fatalf("RegisterTool: %v", err)
+	}
+	
+	if tool.Name() != "get_weather" {
+		t.Errorf("expected name get_weather, got %q", tool.Name())
+	}
+	
+	if tool.Description() != "Get weather information" {
+		t.Errorf("expected description, got %q", tool.Description())
+	}
+	
+	params := tool.Parameters()
+	if params["type"] != "object" {
+		t.Errorf("expected object parameters, got %v", params["type"])
+	}
+	
+	properties := params["properties"].(map[string]any)
+	cityProp := properties["city"].(map[string]any)
+	if cityProp["type"] != "string" || cityProp["description"] != "City name." {
+		t.Errorf("bad city schema: %v", cityProp)
+	}
+	
+	daysProp := properties["days_count"].(map[string]any)
+	if daysProp["type"] != "integer" || daysProp["description"] != "Number of days." {
+		t.Errorf("bad days schema: %v", daysProp)
+	}
+	
+	required := params["required"].([]string)
+	if len(required) != 1 || required[0] != "city" {
+		t.Errorf("expected only city to be required, got %v", required)
 	}
 }

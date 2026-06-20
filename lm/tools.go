@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -43,19 +44,391 @@ type ToolSender interface {
 	SendToolResultsStream(ctx context.Context, results []ToolResult, onPiece func(string)) (string, error)
 }
 
+// ToolDefinition is the common contract every tool attached to a chat/generation session satisfies.
+type ToolDefinition interface {
+	Name() string
+	Description() string
+	Parameters() map[string]any
+}
+
+// dispatchable is implemented by *ManagedTool[I, O] regardless of its type parameters.
+type dispatchable interface {
+	invoke(ctx context.Context, argsJSON []byte) (any, error)
+	policy() ToolPolicy
+}
+
+type ToolPolicy int
+
+const (
+	ToolPolicyReturnOnError ToolPolicy = iota
+	ToolPolicyInformOnError
+)
+
+type ToolOption func(*toolConfig)
+
+type toolConfig struct {
+	policy ToolPolicy
+}
+
+func WithToolPolicy(p ToolPolicy) ToolOption {
+	return func(c *toolConfig) { c.policy = p }
+}
+
+type RawTool struct {
+	name        string
+	description string
+	parameters  map[string]any
+}
+
+func NewRawTool(name, description string, parameters map[string]any) *RawTool {
+	return &RawTool{
+		name:        name,
+		description: description,
+		parameters:  parameters,
+	}
+}
+
+func (r *RawTool) Name() string { return r.name }
+func (r *RawTool) Description() string { return r.description }
+func (r *RawTool) Parameters() map[string]any { return r.parameters }
+
+type ManagedTool[I, O any] struct {
+	name        string
+	description string
+	handler     func(context.Context, I) (O, error)
+	parameters  map[string]any
+	errPolicy   ToolPolicy
+}
+
+func (t *ManagedTool[I, O]) Name() string { return t.name }
+func (t *ManagedTool[I, O]) Description() string { return t.description }
+func (t *ManagedTool[I, O]) Parameters() map[string]any { return t.parameters }
+func (t *ManagedTool[I, O]) policy() ToolPolicy { return t.errPolicy }
+
+func (t *ManagedTool[I, O]) invoke(ctx context.Context, argsJSON []byte) (any, error) {
+	var in I
+	if len(argsJSON) > 0 && string(argsJSON) != "null" {
+		if err := json.Unmarshal(argsJSON, &in); err != nil {
+			return nil, fmt.Errorf("lm: tool %q: unmarshal args: %w", t.name, err)
+		}
+	}
+	out, err := t.handler(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func RegisterTool[I, O any](
+	name, description string,
+	handler func(context.Context, I) (O, error),
+	opts ...ToolOption,
+) (*ManagedTool[I, O], error) {
+	if name == "" {
+		return nil, fmt.Errorf("lm: RegisterTool: empty name")
+	}
+	if handler == nil {
+		return nil, fmt.Errorf("lm: RegisterTool %q: nil handler", name)
+	}
+
+	params, err := paramsSchemaOf(reflect.TypeFor[I]())
+	if err != nil {
+		return nil, fmt.Errorf("lm: RegisterTool %q: %w", name, err)
+	}
+
+	cfg := toolConfig{}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
+	tool := &ManagedTool[I, O]{
+		name:        name,
+		description: description,
+		handler:     handler,
+		parameters:  params,
+		errPolicy:   cfg.policy,
+	}
+	return tool, nil
+}
+
+func paramsSchemaOf(t reflect.Type) (map[string]any, error) {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct {
+		return nil, fmt.Errorf("paramsSchemaOf: type %s must be a struct or pointer to struct", t)
+	}
+	return paramsSchemaStruct(t, 0)
+}
+
+func paramsSchemaStruct(t reflect.Type, depth int) (map[string]any, error) {
+	if depth > 32 {
+		return nil, fmt.Errorf("paramsSchemaOf: type %s nests deeper than 32 levels", t)
+	}
+
+	properties := map[string]any{}
+	var required []string
+
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		name := jsonFieldName(f)
+		if name == "-" {
+			continue
+		}
+
+		fieldSchema, err := paramsSchemaForType(f.Type, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		if desc := f.Tag.Get("description"); desc != "" {
+			fieldSchema["description"] = desc
+		}
+		properties[name] = fieldSchema
+
+		if f.Type.Kind() != reflect.Pointer {
+			required = append(required, name)
+		}
+	}
+
+	schema := map[string]any{
+		"type":       "object",
+		"properties": properties,
+	}
+	if len(required) > 0 {
+		schema["required"] = required
+	}
+	return schema, nil
+}
+
+func paramsSchemaForType(t reflect.Type, depth int) (map[string]any, error) {
+	if depth > 32 {
+		return nil, fmt.Errorf("paramsSchemaOf: type %s nests deeper than 32 levels", t)
+	}
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.String:
+		return map[string]any{"type": "string"}, nil
+	case reflect.Bool:
+		return map[string]any{"type": "boolean"}, nil
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return map[string]any{"type": "integer"}, nil
+	case reflect.Float32, reflect.Float64:
+		return map[string]any{"type": "number"}, nil
+	case reflect.Slice, reflect.Array:
+		items, err := paramsSchemaForType(t.Elem(), depth+1)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"type": "array", "items": items}, nil
+	case reflect.Struct:
+		return paramsSchemaStruct(t, depth+1)
+	default:
+		return nil, fmt.Errorf("paramsSchemaOf: unsupported kind %s for type %s", t.Kind(), t)
+	}
+}
+
+func jsonFieldName(f reflect.StructField) string {
+	tag := f.Tag.Get("json")
+	if tag == "-" {
+		return "-"
+	}
+	if tag == "" {
+		return strings.ToLower(f.Name)
+	}
+	if comma := strings.IndexByte(tag, ','); comma >= 0 {
+		tag = tag[:comma]
+	}
+	if tag == "" {
+		return strings.ToLower(f.Name)
+	}
+	return tag
+}
+
+// sendWithDispatch drives the auto-dispatch loop for Session
+func (s *Session) sendWithDispatch(ctx context.Context, firstTurn string, onPiece func(string)) (string, error) {
+	cap := s.o.MaxToolHops
+	if cap <= 0 {
+		cap = 5
+	}
+	registry := make(map[string]ToolDefinition, len(s.o.Tools))
+	for _, t := range s.o.Tools {
+		registry[t.Name()] = t
+	}
+
+	reply, err := s.sendTurn(ctx, firstTurn, onPiece)
+	if err != nil {
+		return "", err
+	}
+
+	for hop := 1; ; hop++ {
+		cleanText, calls, err := s.e.ExtractToolCalls(reply)
+		if err != nil {
+			return "", err
+		}
+		if len(calls) == 0 {
+			return cleanText, nil
+		}
+
+		allDispatchable := true
+		for _, call := range calls {
+			if _, ok := registry[call.Name]; !ok {
+				allDispatchable = false
+				break
+			}
+		}
+
+		if !allDispatchable {
+			return reply, nil
+		}
+
+		if hop > cap {
+			return reply, fmt.Errorf("lm: tool execution exceeded max tool hops limit (%d)", cap)
+		}
+
+		results, err := invokeAll(ctx, calls, registry)
+		if err != nil {
+			return "", err
+		}
+
+		reply, err = s.SendToolResultsStream(ctx, results, onPiece)
+		if err != nil {
+			return "", err
+		}
+	}
+}
+
+// sendWithDispatch drives the auto-dispatch loop for embedSession
+func (s *embedSession) sendWithDispatch(ctx context.Context, firstTurn string, onPiece func(string)) (string, error) {
+	cap := s.o.MaxToolHops
+	if cap <= 0 {
+		cap = 5
+	}
+	registry := make(map[string]ToolDefinition, len(s.o.Tools))
+	for _, t := range s.o.Tools {
+		registry[t.Name()] = t
+	}
+
+	reply, err := s.sendTurn(ctx, firstTurn, onPiece)
+	if err != nil {
+		return "", err
+	}
+
+	for hop := 1; ; hop++ {
+		cleanText, calls, err := s.e.ExtractToolCalls(reply)
+		if err != nil {
+			return "", err
+		}
+		if len(calls) == 0 {
+			return cleanText, nil
+		}
+
+		allDispatchable := true
+		for _, call := range calls {
+			if _, ok := registry[call.Name]; !ok {
+				allDispatchable = false
+				break
+			}
+		}
+
+		if !allDispatchable {
+			return reply, nil
+		}
+
+		if hop > cap {
+			return reply, fmt.Errorf("lm: tool execution exceeded max tool hops limit (%d)", cap)
+		}
+
+		results, err := invokeAll(ctx, calls, registry)
+		if err != nil {
+			return "", err
+		}
+
+		reply, err = s.SendToolResultsStream(ctx, results, onPiece)
+		if err != nil {
+			return "", err
+		}
+	}
+}
+
+func invokeAll(ctx context.Context, calls []ToolCall, registry map[string]ToolDefinition) ([]ToolResult, error) {
+	results := make([]ToolResult, len(calls))
+	for i, call := range calls {
+		def, ok := registry[call.Name]
+		if !ok {
+			return nil, fmt.Errorf("lm: tool %q not registered", call.Name)
+		}
+		d, ok := def.(dispatchable)
+		if !ok {
+			return nil, fmt.Errorf("lm: tool %q is not auto-dispatchable", call.Name)
+		}
+
+		argsJSON, err := json.Marshal(call.Args)
+		if err != nil {
+			return nil, fmt.Errorf("lm: tool %q: marshal args: %w", call.Name, err)
+		}
+
+		out, err := d.invoke(ctx, argsJSON)
+		if err != nil {
+			if d.policy() == ToolPolicyInformOnError {
+				results[i] = ToolResult{
+					Name:     call.Name,
+					Response: map[string]any{"error": err.Error()},
+				}
+				continue
+			}
+			return nil, fmt.Errorf("lm: tool %q: %w", call.Name, err)
+		}
+		results[i] = ToolResult{Name: call.Name, Response: out}
+	}
+	return results, nil
+}
+
+func buildToolsJSON(tools []ToolDefinition) (string, error) {
+	var list []map[string]any
+	for _, t := range tools {
+		list = append(list, map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        t.Name(),
+				"description": t.Description(),
+				"parameters":  t.Parameters(),
+			},
+		})
+	}
+	b, err := json.Marshal(list)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
 // conversationStart renders what precedes the first turn: the system
 // prompt, plus the tool declarations when GenOptions carries tool
 // specs. Tools force a system turn even with an empty system prompt,
 // matching the C++ engine's render.
 func conversationStart(e *Engine, tpl litertlm.PromptTemplates, o GenOptions) (string, error) {
-	if o.ToolsJSON == "" {
+	toolsJSON := o.ToolsJSON
+	if toolsJSON == "" && len(o.Tools) > 0 {
+		var err error
+		toolsJSON, err = buildToolsJSON(o.Tools)
+		if err != nil {
+			return "", err
+		}
+	}
+	if toolsJSON == "" {
 		return renderSystem(tpl, o.System), nil
 	}
 	tt, ok := litertlm.ToolTemplatesFor(e.md.ModelType)
 	if !ok {
 		return "", fmt.Errorf("lm: tools are not supported for model type %q", e.md.ModelType)
 	}
-	decls, err := fcDeclarations(o.ToolsJSON, tt)
+	decls, err := fcDeclarations(toolsJSON, tt)
 	if err != nil {
 		return "", err
 	}

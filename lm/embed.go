@@ -576,7 +576,10 @@ func (s *embedSession) SendStream(ctx context.Context, userText string, onPiece 
 }
 
 func (s *embedSession) send(ctx context.Context, userText string, onPiece func(string)) (string, error) {
-	return s.sendTurn(ctx, s.tpl.User.Prefix+userText+s.tpl.User.Suffix, onPiece)
+	if len(s.o.Tools) == 0 {
+		return s.sendTurn(ctx, s.tpl.User.Prefix+userText+s.tpl.User.Suffix, onPiece)
+	}
+	return s.sendWithDispatch(ctx, s.tpl.User.Prefix+userText+s.tpl.User.Suffix, onPiece)
 }
 
 // SendToolResults delivers function results to the model and decodes

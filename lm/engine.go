@@ -440,15 +440,17 @@ type Message struct {
 
 // GenOptions configures one generation.
 type GenOptions struct {
-	MaxTokens int       // cap on generated tokens
-	Temp      float32   // sampling temperature; 0 = greedy
-	TopK      int       // top-k filter; 0 = off
-	TopP      float32   // top-p / nucleus filter; 0 = off
-	Seed      int64     // sampling RNG seed
-	Spec      bool      // use MTP speculative decoding when available (greedy only)
-	System    string    // optional system prompt, rendered at the conversation start (chat only)
-	ToolsJSON string    // OpenAI-style tool specs, rendered into the conversation start (tool-capable families only)
-	History   []Message // optional pre-populated conversation history
+	MaxTokens   int              // cap on generated tokens
+	Temp        float32          // sampling temperature; 0 = greedy
+	TopK        int              // top-k filter; 0 = off
+	TopP        float32          // top-p / nucleus filter; 0 = off
+	Seed        int64            // sampling RNG seed
+	Spec        bool             // use MTP speculative decoding when available (greedy only)
+	System      string           // optional system prompt, rendered at the conversation start (chat only)
+	ToolsJSON   string           // OpenAI-style tool specs, rendered into the conversation start (tool-capable families only)
+	Tools       []ToolDefinition // high-level tool definitions for auto-dispatching
+	MaxToolHops int              // max hops in tool execution loop
+	History     []Message        // optional pre-populated conversation history
 }
 
 // Generate completes prompt and returns the generated text. When chat is true
@@ -704,7 +706,10 @@ func (s *Session) SendStream(ctx context.Context, userText string, onPiece func(
 }
 
 func (s *Session) send(ctx context.Context, userText string, onPiece func(string)) (string, error) {
-	return s.sendTurn(ctx, s.tpl.User.Prefix+userText+s.tpl.User.Suffix, onPiece)
+	if len(s.o.Tools) == 0 {
+		return s.sendTurn(ctx, s.tpl.User.Prefix+userText+s.tpl.User.Suffix, onPiece)
+	}
+	return s.sendWithDispatch(ctx, s.tpl.User.Prefix+userText+s.tpl.User.Suffix, onPiece)
 }
 
 // SendToolResults delivers function results to the model and decodes

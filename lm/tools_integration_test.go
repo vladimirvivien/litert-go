@@ -73,3 +73,58 @@ func TestToolRound(t *testing.T) {
 		t.Errorf("final = %q, want C++ anchor %q", final, anchor)
 	}
 }
+
+func TestToolAutoDispatch(t *testing.T) {
+	lib := os.Getenv("LITERT_LIB")
+	model := os.Getenv("LITERT_LM_TOOL_MODEL")
+	if lib == "" || model == "" {
+		t.Skip("LITERT_LIB / LITERT_LM_TOOL_MODEL not set")
+	}
+
+	ctx := context.Background()
+	e, err := lm.Open(ctx, model, lm.WithLibDir(lib))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer e.Close()
+
+	type weatherArgs struct {
+		City string `json:"city" description:"City name."`
+	}
+	type weatherResp struct {
+		TempC int    `json:"temp_c"`
+		Sky   string `json:"sky"`
+	}
+
+	getWeather, err := lm.RegisterTool("get_weather", "Get current weather for a city.",
+		func(ctx context.Context, in weatherArgs) (weatherResp, error) {
+			return weatherResp{TempC: 21, Sky: "clear"}, nil
+		})
+	if err != nil {
+		t.Fatalf("RegisterTool: %v", err)
+	}
+
+	conv, err := e.NewConversation(lm.GenOptions{
+		MaxTokens: 256,
+		System:    "You are a helpful assistant.",
+		Tools:     []lm.ToolDefinition{getWeather},
+	})
+	if err != nil {
+		t.Fatalf("NewConversation: %v", err)
+	}
+	defer conv.Close()
+
+	final, err := conv.Send(ctx, "What is the weather in Paris?")
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	t.Logf("final auto-dispatched reply: %q", final)
+	if final == "" {
+		t.Fatal("empty final reply")
+	}
+
+	const anchor = "The weather in Paris is clear with a temperature of 21°C."
+	if final != anchor {
+		t.Errorf("final = %q, want C++ anchor %q", final, anchor)
+	}
+}
