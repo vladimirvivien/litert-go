@@ -3,11 +3,14 @@ package lm
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 	"unsafe"
 
+	"github.com/vladimirvivien/litert-go/audio"
 	"github.com/vladimirvivien/litert-go/litert"
 	"github.com/vladimirvivien/litert-go/litertlm"
+	"github.com/vladimirvivien/litert-go/vision"
 )
 
 // Embedding-input pipeline (gemma 3n/4). The main graph consumes embeddings,
@@ -566,20 +569,20 @@ func (s *embedSession) TokenCount() int {
 }
 
 // Send adds a user message and returns the reply.
-func (s *embedSession) Send(ctx context.Context, userText string) (string, error) {
-	return s.send(ctx, userText, nil)
+func (s *embedSession) Send(ctx context.Context, parts ...Part) (string, error) {
+	return s.send(ctx, parts, nil)
 }
 
 // SendStream is Send with incremental output.
-func (s *embedSession) SendStream(ctx context.Context, userText string, onPiece func(string)) (string, error) {
-	return s.send(ctx, userText, onPiece)
+func (s *embedSession) SendStream(ctx context.Context, parts []Part, onPiece func(string)) (string, error) {
+	return s.send(ctx, parts, onPiece)
 }
 
-func (s *embedSession) send(ctx context.Context, userText string, onPiece func(string)) (string, error) {
+func (s *embedSession) send(ctx context.Context, parts []Part, onPiece func(string)) (string, error) {
 	if len(s.o.Tools) == 0 {
-		return s.sendTurn(ctx, s.tpl.User.Prefix+userText+s.tpl.User.Suffix, onPiece)
+		return s.sendTurn(ctx, parts, false, onPiece)
 	}
-	return s.sendWithDispatch(ctx, s.tpl.User.Prefix+userText+s.tpl.User.Suffix, onPiece)
+	return s.sendWithDispatch(ctx, parts, onPiece)
 }
 
 // SendToolResults delivers function results to the model and decodes
@@ -595,36 +598,158 @@ func (s *embedSession) SendToolResultsStream(ctx context.Context, results []Tool
 	if err != nil {
 		return "", err
 	}
-	return s.sendTurn(ctx, turn, onPiece)
+	return s.sendTurn(ctx, []Part{{Kind: "text", Text: turn}}, true, onPiece)
 }
 
 // sendTurn ingests one rendered turn and decodes the model's reply.
 // The first turn carries the start token and the conversation-start
 // render; later turns first close the previous model turn with its
 // suffix.
-func (s *embedSession) sendTurn(ctx context.Context, turn string, onPiece func(string)) (string, error) {
-	render := turn + s.tpl.Model.Prefix
-	var ids []int32
+func (s *embedSession) sendTurn(ctx context.Context, parts []Part, raw bool, onPiece func(string)) (string, error) {
+	var binaryPart *Part
+	var promptBuilder strings.Builder
+	for _, p := range parts {
+		if p.Kind == "text" || p.Kind == "" {
+			promptBuilder.WriteString(p.Text)
+		} else if p.Kind == "image" || p.Kind == "audio" {
+			if binaryPart != nil {
+				return "", fmt.Errorf("lm: multiple image/audio parts in a single turn are not supported")
+			}
+			pCopy := p
+			binaryPart = &pCopy
+			if p.Kind == "image" {
+				promptBuilder.WriteString("<img>")
+			} else {
+				promptBuilder.WriteString("<start_of_audio>")
+			}
+		} else {
+			return "", fmt.Errorf("lm: unsupported part kind %q", p.Kind)
+		}
+	}
+	prompt := promptBuilder.String()
+
+	var turnText string
+	if raw {
+		turnText = prompt
+	} else {
+		turnText = s.tpl.User.Prefix + prompt + s.tpl.User.Suffix
+	}
+
+	render := turnText + s.tpl.Model.Prefix
 	if !s.started {
-		ids = startIDs(s.e.tok, s.e.md)
 		render = s.start + render
-		s.started = true
 	} else {
 		render = modelBoundary(s.e.md, s.tpl) + render
 	}
-	ids = append(ids, s.e.tok.Encode(render)...)
+
+	var ids []int32
+	var textEmbeds, perLayerEmbeds []float32
+	var err error
+
+	if binaryPart != nil {
+		if err = s.e.requireMultiModal("sendTurn"); err != nil {
+			return "", err
+		}
+
+		var mm []float32
+		var tReal int
+		var marker, beginTok, endTok string
+		var softToken int32
+
+		if binaryPart.Kind == "image" {
+			vp, err := s.e.ensureVision()
+			if err != nil {
+				return "", err
+			}
+			patches, err := vision.Preprocess(binaryPart.Data, binaryPart.Budget)
+			if err != nil {
+				return "", err
+			}
+			mm, tReal, err = vp.encode(s.e.env, patches)
+			if err != nil {
+				return "", err
+			}
+			marker = "<img>"
+			beginTok = "<img>"
+			endTok = "<end_of_image>"
+			softToken = visionSoftToken
+		} else { // "audio"
+			ap, err := s.e.ensureAudio()
+			if err != nil {
+				return "", err
+			}
+			pcm, err := audio.DecodeAudio(binaryPart.Data, "")
+			if err != nil {
+				return "", err
+			}
+			mel := audio.Preprocess(pcm)
+			mm, tReal, err = ap.encode(s.e.env, mel)
+			if err != nil {
+				return "", err
+			}
+			marker = "<start_of_audio>"
+			beginTok = "<start_of_audio>"
+			endTok = "<end_of_audio>"
+			softToken = audioSoftToken
+		}
+
+		before, after, found := strings.Cut(render, marker)
+		if !found {
+			return "", fmt.Errorf("lm: prompt has no %q marker", marker)
+		}
+
+		if !s.started {
+			ids = startIDs(s.e.tok, s.e.md)
+			s.started = true
+		}
+		ids = append(ids, s.e.tok.Encode(before+beginTok)...)
+		for i := 0; i < tReal; i++ {
+			ids = append(ids, softToken)
+		}
+		ids = append(ids, s.e.tok.Encode(endTok+after)...)
+
+		emb, ple, err := s.e.ensureEmbedders()
+		if err != nil {
+			return "", err
+		}
+		textEmbeds, perLayerEmbeds, err = s.e.embedModal(emb, ple, ids, mm, emb.floats, softToken)
+		if err != nil {
+			return "", err
+		}
+	} else {
+		if !s.started {
+			ids = startIDs(s.e.tok, s.e.md)
+			s.started = true
+		}
+		ids = append(ids, s.e.tok.Encode(render)...)
+	}
+
 	if len(ids) == 0 {
 		return "", fmt.Errorf("empty turn")
 	}
 
-	// Batch-ingest all but the last turn token via prefill-at-offset; the decode
-	// graph then feeds the held-back token, whose logits start the reply.
 	p := len(ids) - 1
 	if p > 0 {
-		if err := prefillEmbedRun(ctx, s.e.env, s.e.cm, s.e.pre, s.kv, s.e.emb, s.e.ple, ids[:p], s.pos); err != nil {
-			return "", fmt.Errorf("prefill: %w", err)
+		if binaryPart != nil {
+			emb, ple, err := s.e.ensureEmbedders()
+			if err != nil {
+				return "", err
+			}
+			h := emb.floats
+			l := 0
+			if ple != nil {
+				l = ple.floats
+			}
+			if err := prefillEmbedDataRun(ctx, s.e.env, s.e.cm, s.e.pre, s.kv, textEmbeds[:p*h], perLayerEmbeds[:p*l], p, s.pos); err != nil {
+				return "", fmt.Errorf("prefill: %w", err)
+			}
+		} else {
+			if err := prefillEmbedRun(ctx, s.e.env, s.e.cm, s.e.pre, s.kv, s.e.emb, s.e.ple, ids[:p], s.pos); err != nil {
+				return "", fmt.Errorf("prefill: %w", err)
+			}
 		}
 	}
+
 	pos := s.pos + p
 	if err := s.dec.feed(ids[p], pos); err != nil {
 		return "", err

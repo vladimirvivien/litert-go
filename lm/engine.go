@@ -570,17 +570,21 @@ func (c *Chat) TokenCount() int {
 
 // Send adds a user message and returns the model's reply, retaining both for
 // context on subsequent calls.
-func (c *Chat) Send(ctx context.Context, userText string) (string, error) {
-	return c.send(ctx, userText, nil)
+func (c *Chat) Send(ctx context.Context, parts ...Part) (string, error) {
+	return c.send(ctx, parts, nil)
 }
 
 // SendStream is Send with incremental output: onPiece is called with each newly
 // decoded fragment of the reply as it is produced.
-func (c *Chat) SendStream(ctx context.Context, userText string, onPiece func(string)) (string, error) {
-	return c.send(ctx, userText, onPiece)
+func (c *Chat) SendStream(ctx context.Context, parts []Part, onPiece func(string)) (string, error) {
+	return c.send(ctx, parts, onPiece)
 }
 
-func (c *Chat) send(ctx context.Context, userText string, onPiece func(string)) (string, error) {
+func (c *Chat) send(ctx context.Context, parts []Part, onPiece func(string)) (string, error) {
+	userText, err := textPartsOnly(parts)
+	if err != nil {
+		return "", err
+	}
 	c.hist = append(c.hist, turn{role: "user", text: userText})
 	prompt := buildConversation(c.e.tok, c.e.md, c.tpl, c.hist)
 	var reply string
@@ -601,12 +605,32 @@ func (c *Chat) send(ctx context.Context, userText string, onPiece func(string)) 
 	return reply, nil
 }
 
+// Part is one piece of multimodal input to Conversation.Send/SendStream.
+type Part struct {
+	Kind   string // "text", "image", "audio"
+	Text   string
+	Data   []byte
+	Mime   string
+	Budget int // visual token budget for image parts
+}
+
+func textPartsOnly(parts []Part) (string, error) {
+	var sb strings.Builder
+	for _, p := range parts {
+		if p.Kind != "text" && p.Kind != "" {
+			return "", fmt.Errorf("lm: only text parts are supported on this conversation type")
+		}
+		sb.WriteString(p.Text)
+	}
+	return sb.String(), nil
+}
+
 // Conversation is a multi-turn chat session. Both Chat (re-prefills the history
 // each turn) and Session (reuses the KV cache across turns) satisfy it.
 // Implementations are not safe for concurrent use.
 type Conversation interface {
-	Send(ctx context.Context, userText string) (string, error)
-	SendStream(ctx context.Context, userText string, onPiece func(string)) (string, error)
+	Send(ctx context.Context, parts ...Part) (string, error)
+	SendStream(ctx context.Context, parts []Part, onPiece func(string)) (string, error)
 	TokenCount() int
 	Close()
 }
@@ -696,16 +720,20 @@ func (s *Session) TokenCount() int {
 }
 
 // Send adds a user message and returns the reply.
-func (s *Session) Send(ctx context.Context, userText string) (string, error) {
-	return s.send(ctx, userText, nil)
+func (s *Session) Send(ctx context.Context, parts ...Part) (string, error) {
+	return s.send(ctx, parts, nil)
 }
 
 // SendStream is Send with incremental output.
-func (s *Session) SendStream(ctx context.Context, userText string, onPiece func(string)) (string, error) {
-	return s.send(ctx, userText, onPiece)
+func (s *Session) SendStream(ctx context.Context, parts []Part, onPiece func(string)) (string, error) {
+	return s.send(ctx, parts, onPiece)
 }
 
-func (s *Session) send(ctx context.Context, userText string, onPiece func(string)) (string, error) {
+func (s *Session) send(ctx context.Context, parts []Part, onPiece func(string)) (string, error) {
+	userText, err := textPartsOnly(parts)
+	if err != nil {
+		return "", err
+	}
 	if len(s.o.Tools) == 0 {
 		return s.sendTurn(ctx, s.tpl.User.Prefix+userText+s.tpl.User.Suffix, onPiece)
 	}

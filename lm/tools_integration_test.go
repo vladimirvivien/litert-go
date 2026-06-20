@@ -36,7 +36,7 @@ func TestToolRound(t *testing.T) {
 	}
 	defer conv.Close()
 
-	reply, err := conv.Send(ctx, "What is the weather in Paris?")
+	reply, err := conv.Send(ctx, lm.Part{Text: "What is the weather in Paris?"})
 	if err != nil {
 		t.Fatalf("Send: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestToolAutoDispatch(t *testing.T) {
 	}
 	defer conv.Close()
 
-	final, err := conv.Send(ctx, "What is the weather in Paris?")
+	final, err := conv.Send(ctx, lm.Part{Text: "What is the weather in Paris?"})
 	if err != nil {
 		t.Fatalf("Send: %v", err)
 	}

@@ -304,7 +304,7 @@ func (s *Session) sendWithDispatch(ctx context.Context, firstTurn string, onPiec
 }
 
 // sendWithDispatch drives the auto-dispatch loop for embedSession
-func (s *embedSession) sendWithDispatch(ctx context.Context, firstTurn string, onPiece func(string)) (string, error) {
+func (s *embedSession) sendWithDispatch(ctx context.Context, parts []Part, onPiece func(string)) (string, error) {
 	cap := s.o.MaxToolHops
 	if cap <= 0 {
 		cap = 5
@@ -314,7 +314,7 @@ func (s *embedSession) sendWithDispatch(ctx context.Context, firstTurn string, o
 		registry[t.Name()] = t
 	}
 
-	reply, err := s.sendTurn(ctx, firstTurn, onPiece)
+	reply, err := s.sendTurn(ctx, parts, false, onPiece)
 	if err != nil {
 		return "", err
 	}

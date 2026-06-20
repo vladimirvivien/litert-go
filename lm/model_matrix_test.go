@@ -142,14 +142,14 @@ func matrixModel(t *testing.T, lib, modelPath string, accel litert.HwAccelerator
 			t.Fatalf("conversation: %v", err)
 		}
 		defer conv.Close()
-		r1, err := conv.Send(context.Background(), "My name is Vlad. Remember it.")
+		r1, err := conv.Send(context.Background(), Part{Text: "My name is Vlad. Remember it."})
 		if err != nil {
 			t.Fatalf("turn 1: %v", err)
 		}
 		if r1 == "" {
 			t.Fatal("empty turn 1")
 		}
-		r2, err := conv.Send(context.Background(), "What is my name?")
+		r2, err := conv.Send(context.Background(), Part{Text: "What is my name?"})
 		if err != nil {
 			t.Fatalf("turn 2: %v", err)
 		}
