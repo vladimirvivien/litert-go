@@ -122,7 +122,7 @@ func runRepl(ctx context.Context, eng *lm.Engine, o lm.GenOptions) error {
 			fmt.Fprint(os.Stderr, "> ")
 			continue
 		}
-		if _, err := chat.SendStream(ctx, line, func(p string) { fmt.Print(p) }); err != nil {
+		if _, err := chat.SendStream(ctx, []lm.Part{{Kind: "text", Text: line}}, func(p string) { fmt.Print(p) }); err != nil {
 			return err
 		}
 		fmt.Println()

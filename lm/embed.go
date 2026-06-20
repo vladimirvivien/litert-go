@@ -109,10 +109,12 @@ func (e *Engine) decodeEmbeddingInput(ctx context.Context, prompt []int32, ngen 
 	}
 	defer e.putKVBanks(kv)
 
+	tPrefillStart := time.Now()
 	p := len(prompt) - 1
 	if err := prefillEmbedRun(ctx, e.env, e.cm, e.pre, kv, e.emb, e.ple, prompt[:p], 0); err != nil {
 		return nil, fmt.Errorf("prefill: %w", err)
 	}
+	prefillDuration := time.Since(tPrefillStart)
 
 	dec, err := newEmbedDecoder(e.env, e.cm, e.decode, kv, e.emb, e.ple, smp)
 	if err != nil {
@@ -123,6 +125,7 @@ func (e *Engine) decodeEmbeddingInput(ctx context.Context, prompt []int32, ngen 
 	next := prompt[p]
 	pos := p
 	var gen []int
+	var timeToFirstToken time.Duration
 	t0 := time.Now()
 	for g := 0; g < ngen; g++ {
 		if err := ctx.Err(); err != nil {
@@ -131,6 +134,9 @@ func (e *Engine) decodeEmbeddingInput(ctx context.Context, prompt []int32, ngen 
 		id, err := dec.step(next, pos)
 		if err != nil {
 			return nil, fmt.Errorf("decode step %d: %w", g, err)
+		}
+		if g == 0 {
+			timeToFirstToken = prefillDuration + time.Since(t0)
 		}
 		if stop[id] {
 			break
@@ -142,8 +148,22 @@ func (e *Engine) decodeEmbeddingInput(ctx context.Context, prompt []int32, ngen 
 		next = id
 		pos++
 	}
+	decodeDuration := time.Since(t0)
+
+	e.lastMetrics = PerformanceMetrics{
+		PrefillDuration:  prefillDuration,
+		DecodeDuration:   decodeDuration,
+		TimeToFirstToken: timeToFirstToken,
+		PrefillTokens:    p,
+		DecodeTokens:     len(gen),
+		CacheHits:        0,
+	}
+	if decodeDuration > 0 && len(gen) > 0 {
+		e.lastMetrics.TokensPerSecond = float64(len(gen)) / decodeDuration.Seconds()
+	}
+
 	if e.metrics != nil {
-		e.metrics(DecodeStats{Tokens: len(gen), Decode: time.Since(t0)})
+		e.metrics(DecodeStats{Tokens: len(gen), Decode: decodeDuration})
 	}
 	return gen, nil
 }
@@ -728,7 +748,9 @@ func (s *embedSession) sendTurn(ctx context.Context, parts []Part, raw bool, onP
 		return "", fmt.Errorf("empty turn")
 	}
 
+	cacheHits := s.pos
 	p := len(ids) - 1
+	tPrefillStart := time.Now()
 	if p > 0 {
 		if binaryPart != nil {
 			emb, ple, err := s.e.ensureEmbedders()
@@ -749,7 +771,9 @@ func (s *embedSession) sendTurn(ctx context.Context, parts []Part, raw bool, onP
 			}
 		}
 	}
+	prefillDuration := time.Since(tPrefillStart)
 
+	tFirstTokenStart := time.Now()
 	pos := s.pos + p
 	if err := s.dec.feed(ids[p], pos); err != nil {
 		return "", err
@@ -759,12 +783,14 @@ func (s *embedSession) sendTurn(ctx context.Context, parts []Part, raw bool, onP
 	if err != nil {
 		return "", err
 	}
+	timeToFirstToken := prefillDuration + time.Since(tFirstTokenStart)
 
 	var stream func(int32)
 	if onPiece != nil {
 		stream = s.e.streamer(onPiece)
 	}
 	var gen []int
+	t0 := time.Now()
 	for g := 0; g < s.o.MaxTokens; g++ {
 		if err := ctx.Err(); err != nil {
 			return "", err
@@ -784,7 +810,21 @@ func (s *embedSession) sendTurn(ctx context.Context, parts []Part, raw bool, onP
 			return "", err
 		}
 	}
+	decodeDuration := time.Since(t0)
 	s.pos = pos
+
+	s.e.lastMetrics = PerformanceMetrics{
+		PrefillDuration:  prefillDuration,
+		DecodeDuration:   decodeDuration,
+		TimeToFirstToken: timeToFirstToken,
+		PrefillTokens:    p + 1,
+		DecodeTokens:     len(gen),
+		CacheHits:        cacheHits,
+	}
+	if decodeDuration > 0 && len(gen) > 0 {
+		s.e.lastMetrics.TokensPerSecond = float64(len(gen)) / decodeDuration.Seconds()
+	}
+
 	return s.e.tok.Decode(gen), nil
 }
 

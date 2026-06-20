@@ -59,6 +59,17 @@ func (s DecodeStats) TokensPerSecond() float64 {
 	return float64(s.Tokens) / s.Decode.Seconds()
 }
 
+// PerformanceMetrics describes the performance characteristics of a generation run or turn.
+type PerformanceMetrics struct {
+	PrefillDuration  time.Duration // Time spent on prompt evaluation (prefill stage)
+	DecodeDuration   time.Duration // Time spent generating tokens (decode stage)
+	TimeToFirstToken time.Duration // Time from prefill start to first decoded token
+	PrefillTokens    int           // Number of tokens prefilled
+	DecodeTokens     int           // Number of tokens generated
+	TokensPerSecond  float64       // Decode throughput rate
+	CacheHits        int           // KV cache reused tokens
+}
+
 // resolveLibDir picks the runtime-library directory: the explicit option,
 // then LITERT_LIB, then libfetch's default download location if it exists,
 // then — only with WithFetch — a fresh download.

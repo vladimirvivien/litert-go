@@ -73,6 +73,7 @@ type Engine struct {
 	vision      *visionPipeline // vision encoder + adapter, compiled once on first use
 	audio       *audioPipeline  // audio encoder + adapter, compiled once on first use
 	lastText    string          // most recent streamed output (GenerateStream/SendStream)
+	lastMetrics PerformanceMetrics
 	kvPool      []*kvBanks
 	kvMu        sync.Mutex
 }
@@ -497,6 +498,29 @@ func (e *Engine) GenerateStream(ctx context.Context, prompt string, chat bool, o
 	return e.lastText, nil
 }
 
+// LastMetrics returns the performance metrics from the most recent generation run or session turn.
+func (e *Engine) LastMetrics() PerformanceMetrics {
+	return e.lastMetrics
+}
+
+// GenerateWithMetrics runs synchronous generation and returns the generated text and the PerformanceMetrics.
+func (e *Engine) GenerateWithMetrics(ctx context.Context, prompt string, chat bool, o GenOptions) (string, PerformanceMetrics, error) {
+	text, err := e.Generate(ctx, prompt, chat, o)
+	if err != nil {
+		return "", PerformanceMetrics{}, err
+	}
+	return text, e.lastMetrics, nil
+}
+
+// GenerateStreamWithMetrics runs streaming generation and returns the generated text and the PerformanceMetrics.
+func (e *Engine) GenerateStreamWithMetrics(ctx context.Context, prompt string, chat bool, o GenOptions, onPiece func(string)) (string, PerformanceMetrics, error) {
+	text, err := e.GenerateStream(ctx, prompt, chat, o, onPiece)
+	if err != nil {
+		return "", PerformanceMetrics{}, err
+	}
+	return text, e.lastMetrics, nil
+}
+
 // streamer returns a per-token callback that decodes the running output and
 // reports each new fragment. It records the full text in e.lastText.
 func (e *Engine) streamer(onPiece func(string)) func(int32) {
@@ -784,17 +808,23 @@ func (s *Session) sendTurn(ctx context.Context, turn string, onPiece func(string
 	// C++ executor use. Do not ingest through consecutive asynchronous decode
 	// runs: the WebGPU delegate corrupts the KV cache under that pattern. The
 	// held-back token's decode logits start the reply.
+	cacheHits := s.pos
 	n := len(ids)
+	tPrefillStart := time.Now()
 	if n > 1 {
 		if err := prefillTokenRun(ctx, s.e.env, s.e.cm, s.e.pre, s.kv, ids[:n-1], s.pos); err != nil {
 			return "", err
 		}
 	}
+	prefillDuration := time.Since(tPrefillStart)
+
+	tFirstTokenStart := time.Now()
 	pos := s.pos + n - 1
 	id, err := s.dec.step(ids[n-1], pos)
 	if err != nil {
 		return "", err
 	}
+	timeToFirstToken := prefillDuration + time.Since(tFirstTokenStart)
 	pos++
 
 	var stream func(int32)
@@ -802,6 +832,7 @@ func (s *Session) sendTurn(ctx context.Context, turn string, onPiece func(string
 		stream = s.e.streamer(onPiece)
 	}
 	var gen []int
+	t0 := time.Now()
 	for g := 0; g < s.o.MaxTokens; g++ {
 		if err := ctx.Err(); err != nil {
 			return "", err
@@ -821,7 +852,21 @@ func (s *Session) sendTurn(ctx context.Context, turn string, onPiece func(string
 			return "", err
 		}
 	}
+	decodeDuration := time.Since(t0)
 	s.pos = pos
+
+	s.e.lastMetrics = PerformanceMetrics{
+		PrefillDuration:  prefillDuration,
+		DecodeDuration:   decodeDuration,
+		TimeToFirstToken: timeToFirstToken,
+		PrefillTokens:    n,
+		DecodeTokens:     len(gen),
+		CacheHits:        cacheHits,
+	}
+	if decodeDuration > 0 && len(gen) > 0 {
+		s.e.lastMetrics.TokensPerSecond = float64(len(gen)) / decodeDuration.Seconds()
+	}
+
 	return s.e.tok.Decode(gen), nil
 }
 
@@ -1284,10 +1329,12 @@ func (e *Engine) decodeTokenInput(ctx context.Context, prompt []int32, ngen int,
 	}
 	defer e.putKVBanks(kv)
 
+	tPrefillStart := time.Now()
 	p := len(prompt) - 1
 	if err := prefillTokenRun(ctx, e.env, e.cm, e.pre, kv, prompt[:p], 0); err != nil {
 		return nil, fmt.Errorf("prefill: %w", err)
 	}
+	prefillDuration := time.Since(tPrefillStart)
 
 	dec, err := newDecoder(e.env, e.cm, e.decode, kv, smp)
 	if err != nil {
@@ -1298,6 +1345,7 @@ func (e *Engine) decodeTokenInput(ctx context.Context, prompt []int32, ngen int,
 	next := prompt[p]
 	pos := p
 	var gen []int
+	var timeToFirstToken time.Duration
 	t0 := time.Now()
 	for g := 0; g < ngen; g++ {
 		if err := ctx.Err(); err != nil {
@@ -1306,6 +1354,9 @@ func (e *Engine) decodeTokenInput(ctx context.Context, prompt []int32, ngen int,
 		id, err := dec.step(next, pos)
 		if err != nil {
 			return nil, fmt.Errorf("decode step %d: %w", g, err)
+		}
+		if g == 0 {
+			timeToFirstToken = prefillDuration + time.Since(t0)
 		}
 		if stop[id] {
 			break
@@ -1317,8 +1368,22 @@ func (e *Engine) decodeTokenInput(ctx context.Context, prompt []int32, ngen int,
 		next = id
 		pos++
 	}
+	decodeDuration := time.Since(t0)
+
+	e.lastMetrics = PerformanceMetrics{
+		PrefillDuration:  prefillDuration,
+		DecodeDuration:   decodeDuration,
+		TimeToFirstToken: timeToFirstToken,
+		PrefillTokens:    p,
+		DecodeTokens:     len(gen),
+		CacheHits:        0,
+	}
+	if decodeDuration > 0 && len(gen) > 0 {
+		e.lastMetrics.TokensPerSecond = float64(len(gen)) / decodeDuration.Seconds()
+	}
+
 	if e.metrics != nil {
-		e.metrics(DecodeStats{Tokens: len(gen), Decode: time.Since(t0)})
+		e.metrics(DecodeStats{Tokens: len(gen), Decode: decodeDuration})
 	}
 	return gen, nil
 }
