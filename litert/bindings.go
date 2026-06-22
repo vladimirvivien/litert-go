@@ -118,6 +118,9 @@ var (
 	compiledModelIsFullyAcceleratedFunc = newLazyFun(
 		"LiteRtCompiledModelIsFullyAccelerated",
 		&ffi.TypeSint32, &ffi.TypePointer, &ffi.TypePointer)
+	compiledModelGetErrorMessagesFunc = newLazyFun(
+		"LiteRtCompiledModelGetErrorMessages",
+		&ffi.TypeSint32, &ffi.TypePointer, &ffi.TypePointer)
 	compiledModelResizeInputTensorFunc = newLazyFun(
 		"LiteRtCompiledModelResizeInputTensorNonStrict",
 		&ffi.TypeSint32,

@@ -10,6 +10,7 @@ package lm
 import (
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -60,6 +61,7 @@ type Engine struct {
 	tok         tokenizer
 	md          litertlm.Metadata
 	fileBytes   []byte
+	fileCloser  io.Closer
 	modelKey    string // per-model GPU program-cache namespace
 	pre         prefiller
 	decode      sig
@@ -76,6 +78,8 @@ type Engine struct {
 	lastMetrics PerformanceMetrics
 	kvPool      []*kvBanks
 	kvMu        sync.Mutex
+	prefillBufs map[int]*prefillBufSet
+	cpuThreads  int
 }
 
 // envOptions builds the LiteRt environment options: the runtime-library
@@ -130,13 +134,33 @@ func defaultGPUCacheDir() string {
 // paramTensor marks models with an int32 param_tensor input (MTP models —
 // gemma 4); the C++ engine additionally puts param_tensor in the external set
 // and both patterns in buffer storage.
-func gpuCompileOptions(accel litert.HwAccelerator, modelKey, cacheDir, tag string, mainKV, paramTensor bool) (litert.Options, error) {
+func buildCompileOptions(accel litert.HwAccelerator, modelKey, cacheDir, tag string, mainKV, paramTensor bool, numThreads int) (litert.Options, error) {
+	if accel == litert.AccelCPU {
+		opts, err := litert.NewOptions(litert.AccelCPU)
+		if err != nil {
+			return 0, err
+		}
+		if numThreads <= 0 {
+			numThreads = 4
+		}
+		toml := fmt.Sprintf(
+			"kernel_mode = \"xnnpack\"\n"+
+				"num_threads = %d\n",
+			numThreads)
+		if err := opts.AddOpaqueOption("xnnpack", toml); err != nil {
+			opts.Close()
+			return 0, err
+		}
+		if err := opts.AddOpaqueOption("runtime_options_string", "compress_quantization_zero_points = true\n"); err != nil {
+			opts.Close()
+			return 0, err
+		}
+		return opts, nil
+	}
+
 	opts, err := litert.NewOptions(accel)
 	if err != nil {
 		return 0, err
-	}
-	if accel != litert.AccelGPU {
-		return opts, nil
 	}
 	dir := cacheDir
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -179,8 +203,8 @@ func gpuCompileOptions(accel litert.HwAccelerator, modelKey, cacheDir, tag strin
 }
 
 func (e *Engine) compileOptions(tag string) (litert.Options, error) {
-	return gpuCompileOptions(e.accel, e.modelKey, e.gpuCacheDir, tag,
-		tag == "main", sigHasInput(e.decode, "param_tensor"))
+	return buildCompileOptions(e.accel, e.modelKey, e.gpuCacheDir, tag,
+		tag == "main", sigHasInput(e.decode, "param_tensor"), e.cpuThreads)
 }
 
 // singleKV reports whether the KV cache must run in single-buffer mode (GPU +
@@ -197,8 +221,18 @@ func (e *Engine) singleKV() bool {
 // releases everything. ctx covers Open itself (including an opted-in
 // download), not later generation calls.
 func Open(ctx context.Context, modelPath string, options ...Option) (*Engine, error) {
+	if os.Getenv("TF_CPP_MIN_LOG_LEVEL") == "" {
+		_ = os.Setenv("TF_CPP_MIN_LOG_LEVEL", "3")
+	}
+	if os.Getenv("ABSL_MIN_LOG_LEVEL") == "" {
+		_ = os.Setenv("ABSL_MIN_LOG_LEVEL", "3")
+	}
+	if os.Getenv("GLOG_minloglevel") == "" {
+		_ = os.Setenv("GLOG_minloglevel", "3")
+	}
 	var c openConfig
 	c.accel = litert.AccelCPU
+	c.cpuThreads = 4
 	for _, o := range options {
 		o(&c)
 	}
@@ -231,7 +265,14 @@ func Open(ctx context.Context, modelPath string, options ...Option) (*Engine, er
 	if err != nil {
 		return nil, err
 	}
-	e := &Engine{env: env, accel: c.accel, gpuCacheDir: c.gpuCacheDir, metrics: c.metrics}
+	e := &Engine{
+		env:         env,
+		accel:       c.accel,
+		gpuCacheDir: c.gpuCacheDir,
+		metrics:     c.metrics,
+		prefillBufs: make(map[int]*prefillBufSet),
+		cpuThreads:  c.cpuThreads,
+	}
 	ok := false
 	defer func() {
 		if !ok {
@@ -239,7 +280,7 @@ func Open(ctx context.Context, modelPath string, options ...Option) (*Engine, er
 		}
 	}()
 
-	if e.fileBytes, err = os.ReadFile(modelPath); err != nil {
+	if e.fileBytes, e.fileCloser, err = mmapModel(modelPath); err != nil {
 		return nil, err
 	}
 	e.modelKey = modelCacheKey(modelPath)
@@ -304,6 +345,16 @@ func Open(ctx context.Context, modelPath string, options ...Option) (*Engine, er
 	if e.cm, err = litert.Compile(env, e.model, e.opts); err != nil {
 		return nil, err
 	}
+	if accel, err := e.cm.FullyAccelerated(); err == nil {
+		fmt.Printf("Compiled model is fully accelerated: %t\n", accel)
+		if !accel {
+			if errMsg, err := e.cm.Errors(); err == nil && errMsg != "" {
+				fmt.Printf("Compilation errors/warnings:\n%s\n", errMsg)
+			}
+		}
+	} else {
+		fmt.Printf("Failed to check if fully accelerated: %v\n", err)
+	}
 	ok = true
 	return e, nil
 }
@@ -316,6 +367,19 @@ func (e *Engine) Close() {
 	}
 	e.kvPool = nil
 	e.kvMu.Unlock()
+
+	for _, set := range e.prefillBufs {
+		if set.tokens != 0 {
+			set.tokens.Close()
+		}
+		if set.pos != 0 {
+			set.pos.Close()
+		}
+		if set.mask != 0 {
+			set.mask.Close()
+		}
+	}
+	e.prefillBufs = nil
 
 	if e.emb != nil {
 		e.emb.close()
@@ -344,6 +408,9 @@ func (e *Engine) Close() {
 	if e.env != 0 {
 		e.env.Close()
 	}
+	if e.fileCloser != nil {
+		_ = e.fileCloser.Close()
+	}
 	runtime.KeepAlive(e.fileBytes)
 }
 
@@ -360,7 +427,7 @@ func (e *Engine) ensureEmbedders() (*embedModel, *embedModel, error) {
 	// the C++ engine (EmbeddingLookupText::Initialize). An embedding lookup is a
 	// gather; running it on GPU buys nothing and forces the embedding table into
 	// GPU memory and the GPU weight cache.
-	opts, err := litert.NewOptions(litert.AccelCPU)
+	opts, err := buildCompileOptions(litert.AccelCPU, e.modelKey, e.gpuCacheDir, "embed", false, false, e.cpuThreads)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -560,7 +627,7 @@ func (e *Engine) generate(ctx context.Context, prompt []int32, o GenOptions, onT
 		if err != nil {
 			return nil, err
 		}
-		return decodeSpeculative(ctx, e.env, e.cm, e.fileBytes, e.pre, e.decode, e.verify, emb, ple, prompt, o.MaxTokens, stop, e.accel, e.modelKey, e.gpuCacheDir, onToken)
+		return e.decodeSpeculative(ctx, emb, ple, prompt, o.MaxTokens, stop, onToken)
 	case sigHasInput(e.decode, "embeddings"):
 		_, _, err := e.ensureEmbedders()
 		if err != nil {
@@ -804,6 +871,9 @@ func (s *Session) SendToolResultsStream(ctx context.Context, results []ToolResul
 // render; later turns first close the previous model turn with its
 // suffix.
 func (s *Session) sendTurn(ctx context.Context, turn string, onPiece func(string)) (string, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	render := turn + s.tpl.Model.Prefix
 	var ids []int32
 	if !s.started {
@@ -827,7 +897,7 @@ func (s *Session) sendTurn(ctx context.Context, turn string, onPiece func(string
 	n := len(ids)
 	tPrefillStart := time.Now()
 	if n > 1 {
-		if err := prefillTokenRun(ctx, s.e.env, s.e.cm, s.e.pre, s.kv, ids[:n-1], s.pos); err != nil {
+		if err := s.e.prefillTokenRun(ctx, s.kv, ids[:n-1], s.pos); err != nil {
 			return "", err
 		}
 	}
@@ -1183,13 +1253,13 @@ func (k *kvBanks) close() {
 
 // prefillTokenRun ingests ids into the KV cache starting at position start,
 // chunking across prefill buckets for prompts longer than one bucket.
-func prefillTokenRun(ctx context.Context, env litert.Environment, cm litert.CompiledModel, pre prefiller, kv *kvBanks, ids []int32, start int) error {
+func (e *Engine) prefillTokenRun(ctx context.Context, kv *kvBanks, ids []int32, start int) error {
 	off := 0
-	for _, c := range pre.plan(len(ids)) {
+	for _, c := range e.pre.plan(len(ids)) {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := prefillStep(env, cm, pre.sig[c.bucket], kv, ids[off:off+c.take], start+off); err != nil {
+		if err := e.prefillStep(e.pre.sig[c.bucket], kv, ids[off:off+c.take], start+off); err != nil {
 			return err
 		}
 		off += c.take
@@ -1338,6 +1408,9 @@ func stopSet(tok tokenizer, md litertlm.Metadata) map[int32]bool {
 // allocate the KV cache once, prefill all but the last prompt token, then
 // decode from the held-back token.
 func (e *Engine) decodeTokenInput(ctx context.Context, prompt []int32, ngen int, stop map[int32]bool, smp *sampler, onToken func(int32)) ([]int, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	kv, err := e.getKVBanks(false)
 	if err != nil {
 		return nil, err
@@ -1346,7 +1419,7 @@ func (e *Engine) decodeTokenInput(ctx context.Context, prompt []int32, ngen int,
 
 	tPrefillStart := time.Now()
 	p := len(prompt) - 1
-	if err := prefillTokenRun(ctx, e.env, e.cm, e.pre, kv, prompt[:p], 0); err != nil {
+	if err := e.prefillTokenRun(ctx, kv, prompt[:p], 0); err != nil {
 		return nil, fmt.Errorf("prefill: %w", err)
 	}
 	prefillDuration := time.Since(tPrefillStart)
@@ -1408,41 +1481,68 @@ func (e *Engine) decodeTokenInput(ctx context.Context, prompt []int32, ngen int,
 // and a causal mask lets row r attend [0, start+r+1) so earlier chunks stay
 // visible. Bucket slots past len(ids) hold padding whose KV is later overwritten
 // or never attended.
-func prefillStep(env litert.Environment, cm litert.CompiledModel, g sig, kv *kvBanks, ids []int32, start int) error {
-	tokens, err := allocReqInput(env, cm, g, tokenInput(g))
-	if err != nil {
-		return err
-	}
-	defer tokens.Close()
-	pos, err := allocReqInput(env, cm, g, "input_pos")
-	if err != nil {
-		return err
-	}
-	defer pos.Close()
-	mask, err := allocReqInput(env, cm, g, "mask")
-	if err != nil {
-		return err
-	}
-	defer mask.Close()
+type prefillBufSet struct {
+	tokens litert.TensorBuffer
+	pos    litert.TensorBuffer
+	mask   litert.TensorBuffer
+}
 
-	if err := writeInts(tokens, ids); err != nil { // first len(ids) slots; rest stay 0
+func (e *Engine) prefillStep(g sig, kv *kvBanks, ids []int32, start int) error {
+	bucket, err := bucketSize(g)
+	if err != nil {
 		return err
 	}
+
+	set, ok := e.prefillBufs[bucket]
+	if !ok {
+		tokens, err := allocReqInput(e.env, e.cm, g, tokenInput(g))
+		if err != nil {
+			return err
+		}
+		pos, err := allocReqInput(e.env, e.cm, g, "input_pos")
+		if err != nil {
+			tokens.Close()
+			return err
+		}
+		mask, err := allocReqInput(e.env, e.cm, g, "mask")
+		if err != nil {
+			tokens.Close()
+			pos.Close()
+			return err
+		}
+		set = &prefillBufSet{tokens: tokens, pos: pos, mask: mask}
+		e.prefillBufs[bucket] = set
+	}
+
+	// Write tokens and zero out padding slots
+	tokensAddr, err := set.tokens.Lock(litert.LockWrite)
+	if err != nil {
+		return err
+	}
+	tokensSlice := unsafe.Slice((*int32)(tokensAddr), bucket)
+	copy(tokensSlice[:len(ids)], ids)
+	for i := len(ids); i < bucket; i++ {
+		tokensSlice[i] = 0
+	}
+	if err := set.tokens.Unlock(); err != nil {
+		return err
+	}
+
 	maskShape, _ := inputShape(g, "mask") // [1,1,seq,ctx]
 	seq, ctx := int(maskShape[2]), int(maskShape[3])
 	posVals := make([]int32, seq)
 	for i := range posVals {
 		posVals[i] = int32(start + i)
 	}
-	if err := writeInts(pos, posVals); err != nil {
+	if err := writeInts(set.pos, posVals); err != nil {
 		return err
 	}
 	maskType, _ := g.s.InputType("mask")
-	if err := fillCausalMask(mask, seq, ctx, start, maskType.ElementType); err != nil {
+	if err := fillCausalMask(set.mask, seq, ctx, start, maskType.ElementType); err != nil {
 		return err
 	}
 
-	perCall := map[string]litert.TensorBuffer{tokenInput(g): tokens, "input_pos": pos, "mask": mask}
+	perCall := map[string]litert.TensorBuffer{tokenInput(g): set.tokens, "input_pos": set.pos, "mask": set.mask}
 	in := assemble(g.inNames, perCall, kv.in())
 	out := assemble(g.outNames, nil, kv.out()) // prefill outputs are all KV
 	for i, b := range in {
@@ -1462,7 +1562,7 @@ func prefillStep(env litert.Environment, cm litert.CompiledModel, g sig, kv *kvB
 			return err
 		}
 	}
-	if err := cm.Run(g.idx, in, out); err != nil {
+	if err := e.cm.Run(g.idx, in, out); err != nil {
 		return err
 	}
 	kv.swap()
@@ -1491,6 +1591,12 @@ type decoder struct {
 func newDecoder(env litert.Environment, cm litert.CompiledModel, g sig, kv *kvBanks, smp *sampler) (*decoder, error) {
 	d := &decoder{smp: smp, kv: kv}
 	var err error
+	defer func() {
+		if err != nil {
+			d.close()
+		}
+	}()
+
 	if d.tokens, err = allocReqInput(env, cm, g, tokenInput(g)); err != nil {
 		return nil, err
 	}
@@ -1566,6 +1672,7 @@ func (d *decoder) feed(token int32, pos int) error {
 	if err := fillCausalMask(d.mask, 1, d.ctx, pos, d.maskET); err != nil {
 		return err
 	}
+
 	run := d.runA // reads bank a
 	if d.kv.bIn {
 		run = d.runB // reads bank b
@@ -1594,12 +1701,24 @@ func (d *decoder) step(token int32, pos int) (int32, error) {
 }
 
 func (d *decoder) close() {
-	d.runA.Close()
-	d.runB.Close()
-	d.logits.Close()
-	d.mask.Close()
-	d.posBuf.Close()
-	d.tokens.Close()
+	if d.runA != nil {
+		d.runA.Close()
+	}
+	if d.runB != nil {
+		d.runB.Close()
+	}
+	if d.logits != 0 {
+		d.logits.Close()
+	}
+	if d.mask != 0 {
+		d.mask.Close()
+	}
+	if d.posBuf != 0 {
+		d.posBuf.Close()
+	}
+	if d.tokens != 0 {
+		d.tokens.Close()
+	}
 }
 
 // --- shared tensor helpers ---
@@ -1777,7 +1896,7 @@ func (s *Session) ingestHistory(ctx context.Context, history []Message) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	if err := prefillTokenRun(ctx, s.e.env, s.e.cm, s.e.pre, s.kv, ids, 0); err != nil {
+	if err := s.e.prefillTokenRun(ctx, s.kv, ids, 0); err != nil {
 		return err
 	}
 	s.pos = len(ids)

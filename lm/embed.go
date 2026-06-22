@@ -3,6 +3,7 @@ package lm
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"strings"
 	"time"
 	"unsafe"
@@ -91,6 +92,29 @@ func (e *embedModel) embed(token int32) ([]float32, error) {
 	return out, nil
 }
 
+// embedDirect runs the embedding model and copies data directly using unsafe.Slice
+// from the source mapped address to the target buffer mapped address.
+func (e *embedModel) embedDirect(token int32, dest litert.TensorBuffer) error {
+	if err := writeInts(e.in, []int32{token}); err != nil {
+		return err
+	}
+	if err := e.runner.Run(); err != nil {
+		return err
+	}
+	srcAddr, err := e.out.Lock(litert.LockRead)
+	if err != nil {
+		return err
+	}
+	defer e.out.Unlock()
+	destAddr, err := dest.Lock(litert.LockWrite)
+	if err != nil {
+		return err
+	}
+	defer dest.Unlock()
+	copy(unsafe.Slice((*float32)(destAddr), e.floats), unsafe.Slice((*float32)(srcAddr), e.floats))
+	return nil
+}
+
 func (e *embedModel) close() {
 	e.runner.Close()
 	e.in.Close()
@@ -103,6 +127,9 @@ func (e *embedModel) close() {
 // i8 KV cache, prefill all but the last prompt token through the shared embedder
 // stages, then greedily decode from the held-back token.
 func (e *Engine) decodeEmbeddingInput(ctx context.Context, prompt []int32, ngen int, stop map[int32]bool, smp *sampler, onToken func(int32)) ([]int, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	kv, err := e.getKVBanks(e.singleKV())
 	if err != nil {
 		return nil, err
@@ -439,30 +466,46 @@ func newEmbedDecoder(env litert.Environment, cm litert.CompiledModel, g sig, kv 
 // submitted asynchronously when the backend supports it; sampling (or the next
 // feed) waits for completion through the logits buffer's event.
 func (d *embedDecoder) feed(token int32, pos int) error {
+	t0 := time.Now()
 	if d.pending {
+		tWait := time.Now()
 		if err := d.out["logits"].Wait(); err != nil {
 			return err
 		}
 		d.pending = false
+		fmt.Printf(" [profile] wait logits: %v\n", time.Since(tWait))
 	}
-	text, perLayer, err := embedTokens(d.emb, d.ple, []int32{token})
-	if err != nil {
-		return err
-	}
+	tEmb := time.Now()
 	d.pos[0] = int32(pos)
 	for name, b := range d.in {
-		if err := fillEmbedInput(b, name, text, perLayer, d.pos, 1, d.ctx, 1, pos); err != nil {
-			return err
+		switch name {
+		case "embeddings":
+			if err := d.emb.embedDirect(token, b); err != nil {
+				return err
+			}
+		case "per_layer_embeddings":
+			if d.ple != nil {
+				if err := d.ple.embedDirect(token, b); err != nil {
+					return err
+				}
+			}
+		default:
+			if err := fillEmbedInput(b, name, nil, nil, d.pos, 1, d.ctx, 1, pos); err != nil {
+				return err
+			}
 		}
 	}
+	fmt.Printf(" [profile] embed + inputs: %v\n", time.Since(tEmb))
 	run := d.runA // reads bank a
 	if d.kv.bIn {
 		run = d.runB // reads bank b
 	}
+	tRun := time.Now()
 	async, err := run.RunAsync()
 	if err != nil {
 		return err
 	}
+	fmt.Printf(" [profile] run async: %v | total feed: %v\n", time.Since(tRun), time.Since(t0))
 	d.kv.swap()
 	d.pending = async
 	return nil
@@ -472,7 +515,10 @@ func (d *embedDecoder) feed(token int32, pos int) error {
 // the logits buffer waits out any in-flight async run.
 func (d *embedDecoder) sample() (int32, error) {
 	d.pending = false
-	return d.smp.sample(d.out["logits"], d.vocab)
+	tSample := time.Now()
+	id, err := d.smp.sample(d.out["logits"], d.vocab)
+	fmt.Printf(" [profile] sample time: %v\n", time.Since(tSample))
+	return id, err
 }
 
 func (d *embedDecoder) step(token int32, pos int) (int32, error) {
@@ -626,6 +672,9 @@ func (s *embedSession) SendToolResultsStream(ctx context.Context, results []Tool
 // render; later turns first close the previous model turn with its
 // suffix.
 func (s *embedSession) sendTurn(ctx context.Context, parts []Part, raw bool, onPiece func(string)) (string, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	var binaryPart *Part
 	var promptBuilder strings.Builder
 	for _, p := range parts {

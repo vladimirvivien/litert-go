@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/vladimirvivien/litert-go/litert"
 	"github.com/vladimirvivien/litert-go/litertlm"
@@ -257,46 +258,48 @@ func elemCount(g sig, name string, out bool) int {
 
 // decodeSpeculative runs MTP speculative decoding on an embedding-input model
 // that has a verify signature and an mtp_drafter section.
-func decodeSpeculative(ctx context.Context, env litert.Environment, cm litert.CompiledModel, fileBytes []byte, pre prefiller, decode, verifySig sig, emb, ple *embedModel, prompt []int32, ngen int, stop map[int32]bool, accel litert.HwAccelerator, modelKey, cacheDir string, onToken func(int32)) ([]int, error) {
-	if accel == litert.AccelGPU && sigHasInput(decode, "param_tensor") {
+func (e *Engine) decodeSpeculative(ctx context.Context, emb, ple *embedModel, prompt []int32, ngen int, stop map[int32]bool, onToken func(int32)) ([]int, error) {
+	if e.accel == litert.AccelGPU && sigHasInput(e.decode, "param_tensor") {
 		// The GPU single-buffer KV mode keeps the cache inside each compiled
 		// model's delegate; the drafter cannot share the base model's KV
 		// through bound buffers there.
 		return nil, fmt.Errorf("%w for param_tensor models on GPU", ErrSpecUnsupported)
 	}
-	opts, err := gpuCompileOptions(accel, modelKey, cacheDir, "spec", true, sigHasInput(decode, "param_tensor"))
+	opts, err := buildCompileOptions(e.accel, e.modelKey, e.gpuCacheDir, "spec", true, sigHasInput(e.decode, "param_tensor"), 4)
 	if err != nil {
 		return nil, err
 	}
 	defer opts.Close()
 
-	draftSec, err := litertlm.SectionTFLiteModelType(fileBytes, litertlm.TFLiteMTPDrafter)
+	draftSec, err := litertlm.SectionTFLiteModelType(e.fileBytes, litertlm.TFLiteMTPDrafter)
 	if err != nil {
 		return nil, fmt.Errorf("mtp drafter section: %w", err)
 	}
 
-	kv, err := allocKVBanks(env, cm, pre.max(), accel == litert.AccelGPU && sigHasInput(decode, "param_tensor"))
+	kv, err := allocKVBanks(e.env, e.cm, e.pre.max(), e.accel == litert.AccelGPU && sigHasInput(e.decode, "param_tensor"))
 	if err != nil {
 		return nil, err
 	}
 	defer kv.close()
 
+	tPrefillStart := time.Now()
 	p := len(prompt) - 1
-	if err := prefillEmbedRun(ctx, env, cm, pre, kv, emb, ple, prompt[:p], 0); err != nil {
+	if err := prefillEmbedRun(ctx, e.env, e.cm, e.pre, kv, emb, ple, prompt[:p], 0); err != nil {
 		return nil, fmt.Errorf("prefill: %w", err)
 	}
+	prefillDuration := time.Since(tPrefillStart)
 
-	dec, err := newEmbedDecoder(env, cm, decode, kv, emb, ple, &sampler{}) // greedy
+	dec, err := newEmbedDecoder(e.env, e.cm, e.decode, kv, emb, ple, &sampler{}) // greedy
 	if err != nil {
 		return nil, fmt.Errorf("decode setup: %w", err)
 	}
 	defer dec.close()
-	ver, err := newVerifier(env, cm, verifySig, kv, emb, ple)
+	ver, err := newVerifier(e.env, e.cm, e.verify, kv, emb, ple)
 	if err != nil {
 		return nil, fmt.Errorf("verify setup: %w", err)
 	}
 	defer ver.close()
-	drf, err := newMtpDraft(env, opts, draftSec, kv)
+	drf, err := newMtpDraft(e.env, opts, draftSec, kv)
 	if err != nil {
 		return nil, fmt.Errorf("drafter setup: %w", err)
 	}
@@ -307,6 +310,10 @@ func decodeSpeculative(ctx context.Context, env litert.Environment, cm litert.Co
 	passes := 0 // verify passes (≈ one base-model forward each)
 	pos := p
 	pending := prompt[p]
+	
+	var timeToFirstToken time.Duration
+	t0 := time.Now()
+
 	defer func() {
 		if passes > 0 {
 			fmt.Fprintf(os.Stderr, "spec: %d tokens over %d verify passes (%.2f tokens/pass)\n",
@@ -321,6 +328,9 @@ func decodeSpeculative(ctx context.Context, env litert.Environment, cm litert.Co
 		tokenID, act, err := dec.stepAct(pending, pos)
 		if err != nil {
 			return nil, fmt.Errorf("decode @%d: %w", pos, err)
+		}
+		if passes == 1 {
+			timeToFirstToken = prefillDuration + time.Since(t0)
 		}
 		if stop[tokenID] {
 			break
@@ -397,5 +407,23 @@ func decodeSpeculative(ctx context.Context, env litert.Environment, cm litert.Co
 		pos = pos + nc + 2
 		pending = bonus
 	}
+	
+	decodeDuration := time.Since(t0)
+	
+	e.lastMetrics = PerformanceMetrics{
+		PrefillDuration:  prefillDuration,
+		DecodeDuration:   decodeDuration,
+		TimeToFirstToken: timeToFirstToken,
+		PrefillTokens:    p,
+		DecodeTokens:     len(gen),
+		CacheHits:        0,
+	}
+	if decodeDuration > 0 && len(gen) > 0 {
+		e.lastMetrics.TokensPerSecond = float64(len(gen)) / decodeDuration.Seconds()
+	}
+	if e.metrics != nil {
+		e.metrics(DecodeStats{Tokens: len(gen), Decode: decodeDuration})
+	}
+
 	return gen, nil
 }

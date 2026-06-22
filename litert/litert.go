@@ -4,10 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"runtime"
-	"sync"
 	"unsafe"
-
-	"github.com/jupiterrider/ffi"
 )
 
 // Status is a LiteRtStatus code.
@@ -292,11 +289,7 @@ func OpenModel(env Environment, path string) (Model, error) {
 // LiteRtCreateModelFromBuffer takes a leading LiteRtEnvironment. The 2.1.5
 // prebuilt does not; later runtimes do. LiteRtCreateModelFromFd shipped in the
 // same API change, so its presence selects the variant.
-var modelBufferTakesEnv = sync.OnceValue(func() bool {
-	_, err := prepSymbol("LiteRtCreateModelFromFd", &ffi.TypeSint32,
-		&ffi.TypePointer, &ffi.TypeSint32, &ffi.TypePointer)
-	return err == nil
-})
+var modelBufferTakesEnv = func() bool { return false }
 
 // OpenModelFromBuffer loads a .tflite model from memory. The LiteRT C API keeps
 // a reference to the buffer for the model's lifetime, so the caller must keep
@@ -561,6 +554,28 @@ func (c CompiledModel) FullyAccelerated() (bool, error) {
 
 	st := invoke(&pin, compiledModelIsFullyAcceleratedFunc, unsafe.Pointer(&h), unsafe.Pointer(&outp))
 	return out, st.err("LiteRtCompiledModelIsFullyAccelerated")
+}
+
+// Errors returns the compiler/fallback error messages from compilation.
+func (c CompiledModel) Errors() (string, error) {
+	var pin runtime.Pinner
+	defer pin.Unpin()
+
+	h := uintptr(c)
+	pin.Pin(&h)
+	var errsPtr uintptr
+	pin.Pin(&errsPtr)
+	errsPtrp := unsafe.Pointer(&errsPtr)
+	pin.Pin(&errsPtrp)
+
+	st := invoke(&pin, compiledModelGetErrorMessagesFunc, unsafe.Pointer(&h), unsafe.Pointer(&errsPtrp))
+	if !st.Ok() {
+		return "", st.err("LiteRtCompiledModelGetErrorMessages")
+	}
+	if errsPtr == 0 {
+		return "", nil
+	}
+	return goString(unsafe.Pointer(errsPtr)), nil
 }
 
 // ResizeInput resizes a signature input to concrete dims. LLM models declare

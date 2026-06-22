@@ -42,10 +42,7 @@ func (e *Engine) ensureVision() (*visionPipeline, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The vision adapter runs on CPU regardless of the engine accelerator
-	// (the C++ engine's VisionExecutorSettings: "Vision adapter can only run
-	// on CPU").
-	adpOpts, err := litert.NewOptions(litert.AccelCPU)
+	adpOpts, err := buildCompileOptions(litert.AccelCPU, e.modelKey, e.gpuCacheDir, "vision_adp", false, false, e.cpuThreads)
 	if err != nil {
 		opts.Close()
 		return nil, err

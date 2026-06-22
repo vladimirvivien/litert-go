@@ -42,27 +42,107 @@ func (s *sampler) sample(b litert.TensorBuffer, vocab int) (int32, error) {
 	return s.sampleLogits(logits), nil
 }
 
-func (s *sampler) sampleLogits(logits []float32) int32 {
-	type cand struct {
-		id    int
-		logit float32
+func (s *sampler) sampleAddr(addr unsafe.Pointer, vocab int) int32 {
+	if s.greedy() {
+		return argmaxF32Addr(addr, vocab)
 	}
-	cands := make([]cand, len(logits))
+	logits := unsafe.Slice((*float32)(addr), vocab)
+	return s.sampleLogits(logits)
+}
+
+func argmaxF32Addr(addr unsafe.Pointer, n int) int32 {
+	vals := unsafe.Slice((*float32)(addr), n)
+	best, idx := vals[0], 0
+	for i, v := range vals {
+		if v > best {
+			best, idx = v, i
+		}
+	}
+	return int32(idx)
+}
+
+type cand struct {
+	id    int
+	logit float32
+}
+
+func heapUp(h []cand, i int) {
+	for {
+		parent := (i - 1) / 2
+		if parent == i || h[i].logit >= h[parent].logit {
+			break
+		}
+		h[i], h[parent] = h[parent], h[i]
+		i = parent
+	}
+}
+
+func heapDown(h []cand, i int) {
+	n := len(h)
+	for {
+		left := 2*i + 1
+		if left >= n || left < 0 {
+			break
+		}
+		smallest := left
+		if right := left + 1; right < n && h[right].logit < h[left].logit {
+			smallest = right
+		}
+		if h[smallest].logit >= h[i].logit {
+			break
+		}
+		h[i], h[smallest] = h[smallest], h[i]
+		i = smallest
+	}
+}
+
+func (s *sampler) topKCandidates(logits []float32, k int, h []cand) []cand {
+	if k <= 0 || k > len(logits) {
+		k = 200 // reasonable fallback limit to avoid sorting all 256,000 elements
+	}
+	if cap(h) < k+1 {
+		h = make([]cand, 0, k+1)
+	} else {
+		h = h[:0]
+	}
 	for i, v := range logits {
-		cands[i] = cand{i, v / s.temp}
+		if len(h) < k {
+			h = append(h, cand{id: i, logit: v})
+			heapUp(h, len(h)-1)
+		} else if v > h[0].logit {
+			h[0] = cand{id: i, logit: v}
+			heapDown(h, 0)
+		}
 	}
-	if s.topK > 0 && s.topK < len(cands) {
-		sort.Slice(cands, func(a, b int) bool { return cands[a].logit > cands[b].logit })
-		cands = cands[:s.topK]
+	invTemp := 1.0 / s.temp
+	for i := range h {
+		h[i].logit *= invTemp
+	}
+	sort.Slice(h, func(i, j int) bool {
+		return h[i].logit > h[j].logit
+	})
+	return h
+}
+
+func (s *sampler) sampleLogits(logits []float32) int32 {
+	var candsBuf [256]cand
+	var cands []cand
+	if s.topK > 0 {
+		cands = s.topKCandidates(logits, s.topK, candsBuf[:0])
+	} else {
+		cands = s.topKCandidates(logits, 200, candsBuf[:0])
 	}
 
 	maxL := cands[0].logit
-	for _, c := range cands {
-		if c.logit > maxL {
-			maxL = c.logit
-		}
+
+	var probsBuf [256]float64
+	var probs []float64
+	if len(cands) <= len(probsBuf) {
+		probs = probsBuf[:len(cands)]
+	} else {
+		probs = make([]float64, len(cands))
 	}
-	probs := make([]float64, len(cands))
+
 	var sum float64
 	for i, c := range cands {
 		p := math.Exp(float64(c.logit - maxL))
@@ -73,36 +153,31 @@ func (s *sampler) sampleLogits(logits []float32) int32 {
 		probs[i] /= sum
 	}
 
-	order := make([]int, len(cands))
-	for i := range order {
-		order[i] = i
-	}
-	sort.Slice(order, func(a, b int) bool { return probs[order[a]] > probs[order[b]] })
-
 	// Nucleus: keep the smallest prefix whose cumulative probability reaches topP.
-	cut := len(order)
+	cut := len(cands)
 	if s.topP > 0 && s.topP < 1 {
 		var cum float64
-		for k, i := range order {
+		for i := 0; i < len(cands); i++ {
 			cum += probs[i]
 			if cum >= float64(s.topP) {
-				cut = k + 1
+				cut = i + 1
 				break
 			}
 		}
 	}
 
 	var kept float64
-	for _, i := range order[:cut] {
+	for i := 0; i < cut; i++ {
 		kept += probs[i]
 	}
 	r := s.rng.Float64() * kept
 	var acc float64
-	for _, i := range order[:cut] {
+	for i := 0; i < cut; i++ {
 		acc += probs[i]
 		if r < acc {
 			return int32(cands[i].id)
 		}
 	}
-	return int32(cands[order[0]].id)
+	return int32(cands[0].id)
 }
+

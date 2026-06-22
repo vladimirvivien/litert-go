@@ -20,6 +20,7 @@ type openConfig struct {
 	metrics      func(DecodeStats)
 	fetchVersion string
 	minLogLevel  *int64
+	cpuThreads   int
 }
 
 // WithLibDir sets the directory holding libLiteRt and its accelerator
@@ -30,6 +31,11 @@ func WithLibDir(dir string) Option { return func(c *openConfig) { c.libDir = dir
 // WithAccelerator selects the compilation backend. The default is CPU.
 func WithAccelerator(a litert.HwAccelerator) Option {
 	return func(c *openConfig) { c.accel = a }
+}
+
+// WithCPUThreads sets the number of threads for the CPU backend compilation.
+func WithCPUThreads(n int) Option {
+	return func(c *openConfig) { c.cpuThreads = n }
 }
 
 // WithGPUCacheDir sets the directory for persisting compiled GPU programs
