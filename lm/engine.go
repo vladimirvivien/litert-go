@@ -212,7 +212,22 @@ func Open(ctx context.Context, modelPath string, options ...Option) (*Engine, er
 	if c.gpuCacheDir == "" {
 		c.gpuCacheDir = defaultGPUCacheDir()
 	}
-	env, err := litert.NewEnvironment(envOptions(libDir)...)
+	envOpts := envOptions(libDir)
+	if c.gpuCacheDir != "" {
+		_ = os.MkdirAll(c.gpuCacheDir, 0o755)
+		envOpts = append(envOpts, litert.EnvOption{
+			Tag: litert.EnvCompilerCacheDir,
+			Str: c.gpuCacheDir,
+		})
+	}
+	if c.minLogLevel != nil {
+		envOpts = append(envOpts, litert.EnvOption{
+			Tag:    litert.EnvMinLoggerSeverity,
+			IsInt:  true,
+			IntVal: *c.minLogLevel,
+		})
+	}
+	env, err := litert.NewEnvironment(envOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1422,7 +1437,8 @@ func prefillStep(env litert.Environment, cm litert.CompiledModel, g sig, kv *kvB
 	if err := writeInts(pos, posVals); err != nil {
 		return err
 	}
-	if err := fillCausalMask(mask, seq, ctx, start); err != nil {
+	maskType, _ := g.s.InputType("mask")
+	if err := fillCausalMask(mask, seq, ctx, start, maskType.ElementType); err != nil {
 		return err
 	}
 
@@ -1462,6 +1478,7 @@ type decoder struct {
 	tokens     litert.TensorBuffer
 	posBuf     litert.TensorBuffer
 	mask       litert.TensorBuffer
+	maskET     litert.ElementType
 	logits     litert.TensorBuffer
 	runA, runB *litert.Runner
 	kv         *kvBanks
@@ -1482,6 +1499,9 @@ func newDecoder(env litert.Environment, cm litert.CompiledModel, g sig, kv *kvBa
 	}
 	if d.mask, err = allocReqInput(env, cm, g, "mask"); err != nil {
 		return nil, err
+	}
+	if maskType, err := g.s.InputType("mask"); err == nil {
+		d.maskET = maskType.ElementType
 	}
 	if d.logits, err = allocReqOutput(env, cm, g, "logits"); err != nil {
 		return nil, err
@@ -1543,7 +1563,7 @@ func (d *decoder) feed(token int32, pos int) error {
 	if err := writeInts(d.posBuf, []int32{int32(pos)}); err != nil {
 		return err
 	}
-	if err := fillCausalMask(d.mask, 1, d.ctx, pos); err != nil {
+	if err := fillCausalMask(d.mask, 1, d.ctx, pos, d.maskET); err != nil {
 		return err
 	}
 	run := d.runA // reads bank a
@@ -1630,6 +1650,9 @@ func assemble(names []string, perCall, kv map[string]litert.TensorBuffer) []lite
 // does not support (host memory) are zeroed through Lock, where the mapped
 // window covers the full size.
 func newZeroedSized(env litert.Environment, bt litert.BufferType, tt litert.TensorType, size uint64) (litert.TensorBuffer, error) {
+	if size%4 != 0 {
+		size = size + 4 - (size % 4)
+	}
 	buf, err := litert.NewManagedBuffer(env, bt, tt, size)
 	if err != nil {
 		return 0, err
@@ -1659,25 +1682,42 @@ func writeInts(b litert.TensorBuffer, vals []int32) error {
 	return b.Unlock()
 }
 
-// fillCausalMask fills a [1,1,rows,ctx] f32 mask: row r (position startPos+r)
+// fillCausalMask fills a [1,1,rows,ctx] mask: row r (position startPos+r)
 // attends columns [0, startPos+r+1), the rest are masked.
-func fillCausalMask(b litert.TensorBuffer, rows, ctx, startPos int) error {
+func fillCausalMask(b litert.TensorBuffer, rows, ctx, startPos int, et litert.ElementType) error {
 	addr, err := b.Lock(litert.LockWrite)
 	if err != nil {
 		return err
 	}
-	m := unsafe.Slice((*float32)(addr), rows*ctx)
-	for i := range m {
-		m[i] = maskNeg
-	}
-	for r := 0; r < rows; r++ {
-		open := startPos + r + 1
-		if open > ctx {
-			open = ctx
+	if et == litert.ElementBool {
+		m := unsafe.Slice((*byte)(addr), rows*ctx)
+		for i := range m {
+			m[i] = 0 // false (masked)
 		}
-		row := m[r*ctx : r*ctx+ctx]
-		for c := 0; c < open; c++ {
-			row[c] = 0
+		for r := 0; r < rows; r++ {
+			open := startPos + r + 1
+			if open > ctx {
+				open = ctx
+			}
+			row := m[r*ctx : r*ctx+ctx]
+			for c := 0; c < open; c++ {
+				row[c] = 1 // true (attend)
+			}
+		}
+	} else {
+		m := unsafe.Slice((*float32)(addr), rows*ctx)
+		for i := range m {
+			m[i] = maskNeg
+		}
+		for r := 0; r < rows; r++ {
+			open := startPos + r + 1
+			if open > ctx {
+				open = ctx
+			}
+			row := m[r*ctx : r*ctx+ctx]
+			for c := 0; c < open; c++ {
+				row[c] = 0.0
+			}
 		}
 	}
 	return b.Unlock()

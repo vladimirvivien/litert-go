@@ -56,6 +56,7 @@ const (
 	ElementFloat32  ElementType = 1
 	ElementInt32    ElementType = 2
 	ElementInt64    ElementType = 4
+	ElementBool     ElementType = 6
 	ElementInt16    ElementType = 7
 	ElementInt8     ElementType = 9
 	ElementFloat16  ElementType = 10
@@ -72,6 +73,8 @@ func (e ElementType) String() string {
 		return "i32"
 	case ElementInt64:
 		return "i64"
+	case ElementBool:
+		return "bool"
 	case ElementInt16:
 		return "i16"
 	case ElementInt8:
@@ -134,19 +137,27 @@ func (tt TensorType) raw() []byte {
 // argument the C side reads or writes through needs a second level: a pinned
 // holder hp whose value is &slot, passed as unsafe.Pointer(&hp). See ffi.go.
 
-// EnvOptionTag identifies a LiteRtEnvironment string option.
+// EnvOptionTag identifies a LiteRtEnvironment configuration option.
 type EnvOptionTag int32
 
 const (
+	// EnvCompilerCacheDir specifies a writable directory where the environment's
+	// compilers (e.g. CPU/XNNPACK JIT) can serialize/cache compiled kernels.
+	EnvCompilerCacheDir EnvOptionTag = 17
 	// EnvRuntimeLibraryDir is where the runtime looks for accelerator plugins
 	// (e.g. libLiteRtWebGpuAccelerator), so they need not be on the OS path.
 	EnvRuntimeLibraryDir EnvOptionTag = 22
+	// EnvMinLoggerSeverity sets the minimum logging severity level for the environment:
+	// 0 (Verbose), 1 (Info), 2 (Warning), 3 (Error), 4 (Fatal), 5 (None).
+	EnvMinLoggerSeverity EnvOptionTag = 25
 )
 
-// EnvOption is a string-valued LiteRtEnvironment option.
+// EnvOption is a LiteRtEnvironment option, which can be string or integer valued.
 type EnvOption struct {
-	Tag EnvOptionTag
-	Str string
+	Tag    EnvOptionTag
+	Str    string
+	IntVal int64
+	IsInt  bool
 }
 
 // envOptRetain keeps the option strings/buffers alive for the process: LiteRT
@@ -166,19 +177,25 @@ func NewEnvironment(opts ...EnvOption) (Environment, error) {
 	pin.Pin(&numOpts)
 
 	// LiteRtEnvOption is 24 bytes: tag (int32) @0, LiteRtAny value @8 whose type
-	// (int32) is @8 and string pointer @16.
-	const optSize, anyTypeString = 24, int32(8)
+	// (int32) is @8 and string pointer / integer @16.
+	const optSize = 24
+	const anyTypeInt, anyTypeString = int32(2), int32(8)
 	var optsPtr unsafe.Pointer
 	if len(opts) > 0 {
 		buf := make([]byte, len(opts)*optSize)
 		for i, o := range opts {
-			cs := cbytes(o.Str)
-			envOptRetain = append(envOptRetain, cs)
-			pin.Pin(&cs[0])
 			base := i * optSize
 			*(*int32)(unsafe.Pointer(&buf[base])) = int32(o.Tag)
-			*(*int32)(unsafe.Pointer(&buf[base+8])) = anyTypeString
-			*(*uintptr)(unsafe.Pointer(&buf[base+16])) = uintptr(unsafe.Pointer(&cs[0]))
+			if o.IsInt {
+				*(*int32)(unsafe.Pointer(&buf[base+8])) = anyTypeInt
+				*(*int64)(unsafe.Pointer(&buf[base+16])) = o.IntVal
+			} else {
+				cs := cbytes(o.Str)
+				envOptRetain = append(envOptRetain, cs)
+				pin.Pin(&cs[0])
+				*(*int32)(unsafe.Pointer(&buf[base+8])) = anyTypeString
+				*(*uintptr)(unsafe.Pointer(&buf[base+16])) = uintptr(unsafe.Pointer(&cs[0]))
+			}
 		}
 		envOptRetain = append(envOptRetain, buf)
 		pin.Pin(&buf[0])

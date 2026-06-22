@@ -19,6 +19,7 @@ type openConfig struct {
 	gpuCacheDir  string
 	metrics      func(DecodeStats)
 	fetchVersion string
+	minLogLevel  *int64
 }
 
 // WithLibDir sets the directory holding libLiteRt and its accelerator
@@ -38,6 +39,10 @@ func WithGPUCacheDir(dir string) Option { return func(c *openConfig) { c.gpuCach
 // WithMetrics registers a callback that receives decode statistics after each
 // generation or conversation turn. The callback runs on the calling goroutine.
 func WithMetrics(f func(DecodeStats)) Option { return func(c *openConfig) { c.metrics = f } }
+
+// WithMinLogLevel sets the minimum logging severity level for the LiteRT environment:
+// 0 (Verbose), 1 (Info), 2 (Warning), 3 (Error), 4 (Fatal), 5 (None).
+func WithMinLogLevel(level int64) Option { return func(c *openConfig) { c.minLogLevel = &level } }
 
 // WithFetch downloads the runtime libraries (libfetch.Fetch with the given
 // version, e.g. libfetch.DefaultVersion) when no library directory resolves —
