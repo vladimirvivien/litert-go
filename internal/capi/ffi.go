@@ -100,6 +100,17 @@ func (l *LazyFun) CallStatus(pin *runtime.Pinner, args ...any) (int32, error) {
 	return st, nil
 }
 
+// CallStatusWide invokes a LiteRtStatus-returning C function with pre-allocated
+// unsafe.Pointer argument slots and a caller-owned register-width ffi.Arg slot,
+// avoiding per-call slice or reflection allocations on hot paths.
+func (l *LazyFun) CallStatusWide(st *ffi.Arg, args ...unsafe.Pointer) (int32, error) {
+	if err := l.resolve(); err != nil {
+		return 0, err
+	}
+	ffi.Call(l.fun.Cif, l.fun.Addr, unsafe.Pointer(st), args...)
+	return int32(*st), nil
+}
+
 // CallVoid invokes a void-returning C function.
 func (l *LazyFun) CallVoid(args ...any) error {
 	return l.CallErr(nil, args...)

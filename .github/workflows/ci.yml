@@ -58,3 +58,31 @@ jobs:
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.13
+
+  integration:
+    name: runtime integration (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Cache LiteRT 2.4.1 prebuilts
+        uses: actions/cache@v4
+        with:
+          path: .cache/litert-2.4.1
+          key: litert-2.4.1-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Download LiteRT 2.4.1 prebuilts
+        run: go run ./examples/libfetch -dir .cache/litert-2.4.1 -version 2.4.1
+
+      - name: Run live LiteRT runtime integration tests
+        env:
+          LITERT_LIB: ${{ github.workspace }}/.cache/litert-2.4.1
+        run: go test -race -v ./pkg/litert/...
