@@ -1,0 +1,43 @@
+# Standard lint configuration for litert-go (golangci-lint v2 schema).
+#
+# Run locally:  golangci-lint run ./...
+# Apply fixers: golangci-lint fmt
+
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+    - misspell
+    - unconvert
+    - gocritic
+  settings:
+    govet:
+      enable-all: true
+      disable:
+        # FFI call wiring passes &value as unsafe.Pointer per libffi convention.
+        - unsafeptr
+        - fieldalignment
+  exclusions:
+    rules:
+      - path: examples/
+        linters:
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/vladimirvivien/litert-go

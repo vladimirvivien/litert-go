@@ -1,0 +1,7 @@
+# Ensure consistent LF line endings across all platforms and CI environments
+* text=auto eol=lf
+*.go text=auto eol=lf
+*.md text=auto eol=lf
+*.yml text=auto eol=lf
+*.yaml text=auto eol=lf
+Makefile text=auto eol=lf

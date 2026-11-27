@@ -1,0 +1,44 @@
+# Go build and test artifacts
+*.exe
+*.test
+*.out
+coverage.txt
+coverage.html
+/vendor/
+/bin/
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Native shared libraries and staged runtimes
+/lib/
+/dist/
+/dist-*/
+*.dll
+*.so
+*.dylib
+*.a
+
+# Model artifacts (allow tiny committed test fixtures under testdata/)
+*.tflite
+*.litertlm
+!testdata/*.tflite
+
+# Coverage and PGO profiles
+*.profraw
+*.profdata
+
+# Local environment and caches
+.env
+.env.local
+.cache/
+/site/
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
