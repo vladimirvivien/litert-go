@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"runtime"
 	"unsafe"
-
-	"github.com/jupiterrider/ffi"
 )
 
 // Runner binds a CompiledModel signature to a fixed set of input and output
@@ -16,22 +14,15 @@ type Runner struct {
 	cm         *CompiledModel
 	inBufs     []*TensorBuffer
 	outBufs    []*TensorBuffer
+	inIndex    map[string]int
+	outIndex   map[string]int
 	ownedBufs  bool
 	inHandles  []uintptr
 	outHandles []uintptr
+	asyncFlag  byte
 
-	stWide    ffi.Arg
-	cmHandle  uintptr
-	sigIndex  uint64
-	numIn     uint64
-	inPtr     unsafe.Pointer
-	numOut    uint64
-	outPtr    unsafe.Pointer
-	asyncFlag byte
-	asyncPtr  unsafe.Pointer
-
-	syncArgs  []unsafe.Pointer
-	asyncArgs []unsafe.Pointer
+	syncArgs  []uintptr
+	asyncArgs []uintptr
 
 	pin       runtime.Pinner
 	usedAsync bool
@@ -60,63 +51,49 @@ func NewRunner(cm *CompiledModel, sig int, inputs, outputs []*TensorBuffer) (*Ru
 	}
 
 	r := &Runner{
-		cm:       cm,
-		inBufs:   append([]*TensorBuffer(nil), inputs...),
-		outBufs:  append([]*TensorBuffer(nil), outputs...),
-		cmHandle: cm.handle,
-		sigIndex: uint64(sig),
-		numIn:    uint64(len(inputs)),
-		numOut:   uint64(len(outputs)),
+		cm:      cm,
+		inBufs:  append([]*TensorBuffer(nil), inputs...),
+		outBufs: append([]*TensorBuffer(nil), outputs...),
 	}
 
+	var inAddr, outAddr uintptr
 	if len(inputs) > 0 {
 		r.inHandles = make([]uintptr, len(inputs))
 		for i, b := range inputs {
 			r.inHandles[i] = b.handle
 		}
-		r.inPtr = unsafe.Pointer(&r.inHandles[0])
 		r.pin.Pin(&r.inHandles[0])
+		inAddr = uintptr(unsafe.Pointer(&r.inHandles[0]))
 	}
 	if len(outputs) > 0 {
 		r.outHandles = make([]uintptr, len(outputs))
 		for i, b := range outputs {
 			r.outHandles[i] = b.handle
 		}
-		r.outPtr = unsafe.Pointer(&r.outHandles[0])
 		r.pin.Pin(&r.outHandles[0])
+		outAddr = uintptr(unsafe.Pointer(&r.outHandles[0]))
 	}
 
-	r.asyncPtr = unsafe.Pointer(&r.asyncFlag)
-
-	r.pin.Pin(&r.stWide)
-	r.pin.Pin(&r.cmHandle)
-	r.pin.Pin(&r.sigIndex)
-	r.pin.Pin(&r.numIn)
-	r.pin.Pin(&r.inPtr)
-	r.pin.Pin(&r.numOut)
-	r.pin.Pin(&r.outPtr)
 	r.pin.Pin(&r.asyncFlag)
-	r.pin.Pin(&r.asyncPtr)
+	asyncAddr := uintptr(unsafe.Pointer(&r.asyncFlag))
 
-	r.syncArgs = []unsafe.Pointer{
-		unsafe.Pointer(&r.cmHandle),
-		unsafe.Pointer(&r.sigIndex),
-		unsafe.Pointer(&r.numIn),
-		unsafe.Pointer(&r.inPtr),
-		unsafe.Pointer(&r.numOut),
-		unsafe.Pointer(&r.outPtr),
+	r.syncArgs = []uintptr{
+		cm.handle,
+		uintptr(sig),
+		uintptr(len(inputs)),
+		inAddr,
+		uintptr(len(outputs)),
+		outAddr,
 	}
-	r.asyncArgs = []unsafe.Pointer{
-		unsafe.Pointer(&r.cmHandle),
-		unsafe.Pointer(&r.sigIndex),
-		unsafe.Pointer(&r.numIn),
-		unsafe.Pointer(&r.inPtr),
-		unsafe.Pointer(&r.numOut),
-		unsafe.Pointer(&r.outPtr),
-		unsafe.Pointer(&r.asyncPtr),
+	r.asyncArgs = []uintptr{
+		cm.handle,
+		uintptr(sig),
+		uintptr(len(inputs)),
+		inAddr,
+		uintptr(len(outputs)),
+		outAddr,
+		asyncAddr,
 	}
-	r.pin.Pin(&r.syncArgs[0])
-	r.pin.Pin(&r.asyncArgs[0])
 	return r, nil
 }
 
@@ -142,7 +119,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		r.usedAsync = false
 	}
 
-	st, callErr := r.cm.syms.RunCompiledModel.CallStatusWide(&r.stWide, r.syncArgs...)
+	st, callErr := r.cm.syms.RunCompiledModel.CallStatusSyscall(r.syncArgs)
 	return statusErr("LiteRtRunCompiledModel", st, callErr)
 }
 
@@ -166,7 +143,7 @@ func (r *Runner) RunAsync(ctx context.Context) (bool, error) {
 		}
 	}
 	r.asyncFlag = 0
-	st, callErr := r.cm.syms.RunCompiledModelAsync.CallStatusWide(&r.stWide, r.asyncArgs...)
+	st, callErr := r.cm.syms.RunCompiledModelAsync.CallStatusSyscall(r.asyncArgs)
 	if err := statusErr("LiteRtRunCompiledModelAsync", st, callErr); err != nil {
 		return false, err
 	}
@@ -188,6 +165,49 @@ func (r *Runner) Output(i int) *TensorBuffer {
 		return nil
 	}
 	return r.outBufs[i]
+}
+
+// InputByName returns the bound input buffer named name, or nil if absent.
+func (r *Runner) InputByName(name string) *TensorBuffer {
+	if r == nil || r.inIndex == nil {
+		return nil
+	}
+	idx, ok := r.inIndex[name]
+	if !ok {
+		return nil
+	}
+	return r.Input(idx)
+}
+
+// OutputByName returns the bound output buffer named name, or nil if absent.
+func (r *Runner) OutputByName(name string) *TensorBuffer {
+	if r == nil || r.outIndex == nil {
+		return nil
+	}
+	idx, ok := r.outIndex[name]
+	if !ok {
+		return nil
+	}
+	return r.Output(idx)
+}
+
+func (r *Runner) setTensorNames(inNames, outNames []string) {
+	if len(inNames) > 0 {
+		r.inIndex = make(map[string]int, len(inNames))
+		for i, name := range inNames {
+			if name != "" {
+				r.inIndex[name] = i
+			}
+		}
+	}
+	if len(outNames) > 0 {
+		r.outIndex = make(map[string]int, len(outNames))
+		for i, name := range outNames {
+			if name != "" {
+				r.outIndex[name] = i
+			}
+		}
+	}
 }
 
 // NumInputs returns the number of bound input buffers.

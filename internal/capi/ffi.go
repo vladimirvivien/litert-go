@@ -10,6 +10,7 @@ import (
 	"sync"
 	"unsafe"
 
+	"github.com/ebitengine/purego"
 	"github.com/jupiterrider/ffi"
 )
 
@@ -100,15 +101,19 @@ func (l *LazyFun) CallStatus(pin *runtime.Pinner, args ...any) (int32, error) {
 	return st, nil
 }
 
-// CallStatusWide invokes a LiteRtStatus-returning C function with pre-allocated
-// unsafe.Pointer argument slots and a caller-owned register-width ffi.Arg slot,
-// avoiding per-call slice or reflection allocations on hot paths.
-func (l *LazyFun) CallStatusWide(st *ffi.Arg, args ...unsafe.Pointer) (int32, error) {
+// CallStatusSyscall invokes a pointer/integer-only LiteRtStatus-returning C
+// function directly via purego.SyscallN using a caller-owned []uintptr slice,
+// avoiding per-call heap allocations on hot paths. Callers must keep any Go
+// memory addresses referenced in args pinned for the duration of the call.
+func (l *LazyFun) CallStatusSyscall(args []uintptr) (int32, error) {
 	if err := l.resolve(); err != nil {
 		return 0, err
 	}
-	ffi.Call(l.fun.Cif, l.fun.Addr, unsafe.Pointer(st), args...)
-	return int32(*st), nil
+	if l.fun.Addr == 0 {
+		return 0, &MissingSymbolError{Symbol: l.name, Cause: errors.New("resolved symbol has nil address")}
+	}
+	r1, _, _ := purego.SyscallN(l.fun.Addr, args...)
+	return int32(r1), nil
 }
 
 // CallVoid invokes a void-returning C function.

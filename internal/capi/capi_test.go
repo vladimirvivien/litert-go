@@ -162,3 +162,34 @@ func TestOutAndPtrHelpers(t *testing.T) {
 		t.Fatalf("st=%d out=%d, want st=0 out=42", st, out)
 	}
 }
+
+func TestCallStatusSyscall(t *testing.T) {
+	cb := purego.NewCallback(func(a, b uintptr) uintptr {
+		return a + b
+	})
+	lf := NewLazyFun(func(string, *ffi.Type, ...*ffi.Type) (ffi.Fun, error) {
+		return ffi.Fun{Addr: cb}, nil
+	}, "stub_syscall", &ffi.TypeSint32, &ffi.TypeUint64, &ffi.TypeUint64)
+
+	st, err := lf.CallStatusSyscall([]uintptr{3, 4})
+	if err != nil {
+		t.Fatalf("CallStatusSyscall: %v", err)
+	}
+	if st != 7 {
+		t.Fatalf("st = %d, want 7", st)
+	}
+
+	missing := NewLazyFun(func(string, *ffi.Type, ...*ffi.Type) (ffi.Fun, error) {
+		return ffi.Fun{}, errors.New("missing")
+	}, "stub_missing", &ffi.TypeSint32)
+	if _, mErr := missing.CallStatusSyscall(nil); mErr == nil {
+		t.Fatal("expected missing symbol error")
+	}
+
+	nilAddr := NewLazyFun(func(string, *ffi.Type, ...*ffi.Type) (ffi.Fun, error) {
+		return ffi.Fun{}, nil
+	}, "stub_nil", &ffi.TypeSint32)
+	if _, nErr := nilAddr.CallStatusSyscall(nil); nErr == nil {
+		t.Fatal("expected nil address error")
+	}
+}
