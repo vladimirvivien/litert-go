@@ -1,8 +1,19 @@
 # litert-go
 
+[![CI](https://github.com/vladimirvivien/litert-go/actions/workflows/ci.yml/badge.svg)](https://github.com/vladimirvivien/litert-go/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/vladimirvivien/litert-go.svg)](https://pkg.go.dev/github.com/vladimirvivien/litert-go)
+
 `litert-go` provides Go bindings for Google's **LiteRT** `CompiledModel` C API targeting general-purpose `.tflite` inference—image classification, object detection, video-frame pipelines, audio tagging and speech frontends, embeddings, and custom graphs—without CGO.
 
 Generative `.litertlm` LLM orchestration lives separately in [litertlm-go](https://github.com/vladimirvivien/litertlm-go).
+
+## Installation
+
+Requires Go `1.26.2+`. Add the module (or `.../pkg/litert`) and tidy after adding package imports:
+
+```sh
+go get github.com/vladimirvivien/litert-go@latest
+```
 
 ## Runtime Baseline
 

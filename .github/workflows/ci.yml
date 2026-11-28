@@ -74,7 +74,7 @@ jobs:
           go-version-file: 'go.mod'
 
       - name: Cache LiteRT 2.4.1 prebuilts
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .cache/litert-2.4.1
           key: litert-2.4.1-${{ runner.os }}-${{ runner.arch }}-v1
